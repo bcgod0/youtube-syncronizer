@@ -58,9 +58,108 @@
     setTimeout(waitForPlayer, 500);
   }
 
+  let attachedVideo = null;
+  let seekDebounceTimer = null;
+
+  function onVideoPause() {
+    if (!isHost || !isInSession || suppressEvents) return;
+    if (isAdPlaying()) return;
+
+    const video = getVideoElement();
+    const time = video ? video.currentTime : (player ? player.getCurrentTime() : 0);
+    const videoId = getVideoId();
+    const rate = video ? video.playbackRate : 1;
+
+    console.log(`[YT-Sync] Host paused video at ${time.toFixed(2)}s`);
+    lastState = 2;
+    lastTime = time;
+
+    postToContent({
+      type: 'player-event',
+      action: 'pause',
+      videoId,
+      currentTime: time,
+      playbackRate: rate,
+      isPlaying: false,
+    });
+
+    reportPosition();
+  }
+
+  function onVideoPlay() {
+    if (!isHost || !isInSession || suppressEvents) return;
+    if (isAdPlaying()) return;
+
+    const video = getVideoElement();
+    const time = video ? video.currentTime : (player ? player.getCurrentTime() : 0);
+    const videoId = getVideoId();
+    const rate = video ? video.playbackRate : 1;
+
+    console.log(`[YT-Sync] Host played video at ${time.toFixed(2)}s`);
+    lastState = 1;
+    lastTime = time;
+
+    postToContent({
+      type: 'player-event',
+      action: 'play',
+      videoId,
+      currentTime: time,
+      playbackRate: rate,
+      isPlaying: true,
+    });
+
+    reportPosition();
+  }
+
+  function onVideoSeeked() {
+    if (!isHost || !isInSession || suppressEvents) return;
+
+    if (seekDebounceTimer) clearTimeout(seekDebounceTimer);
+    seekDebounceTimer = setTimeout(() => {
+      const video = getVideoElement();
+      if (!video) return;
+      const time = video.currentTime;
+      const videoId = getVideoId();
+      const isPlaying = !video.paused;
+      const rate = video.playbackRate || 1;
+
+      console.log(`[YT-Sync] Host seeked to ${time.toFixed(2)}s (isPlaying: ${isPlaying})`);
+      lastTime = time;
+
+      postToContent({
+        type: 'player-event',
+        action: 'seek',
+        videoId,
+        currentTime: time,
+        playbackRate: rate,
+        isPlaying,
+      });
+
+      reportPosition();
+    }, 40);
+  }
+
+  function attachVideoListeners() {
+    const video = getVideoElement();
+    if (!video || video === attachedVideo) return;
+
+    if (attachedVideo) {
+      attachedVideo.removeEventListener('pause', onVideoPause);
+      attachedVideo.removeEventListener('play', onVideoPlay);
+      attachedVideo.removeEventListener('seeked', onVideoSeeked);
+    }
+
+    attachedVideo = video;
+    video.addEventListener('pause', onVideoPause);
+    video.addEventListener('play', onVideoPlay);
+    video.addEventListener('seeked', onVideoSeeked);
+    console.log('[YT-Sync] Attached native video listeners for instant control');
+  }
+
   function initPlayer() {
     console.log('[YT-Sync] YouTube player ready');
     lastVideoId = getVideoId();
+    attachVideoListeners();
     postToContent({ type: 'player-ready' });
 
     // Monitor playback state changes (every 200ms)
@@ -71,6 +170,7 @@
   }
 
   function onPageNavigated() {
+    attachVideoListeners();
     if (!isInSession || !isHost) return;
     const newId = getVideoId();
     if (newId && newId !== lastVideoId) {
@@ -105,6 +205,9 @@
     if (!player || suppressEvents || !isInSession || !isHost) return;
     if (isAdPlaying()) return;
 
+    // Ensure native listeners are attached to active video element
+    attachVideoListeners();
+
     try {
       const state = player.getPlayerState();
       const video = getVideoElement();
@@ -128,8 +231,21 @@
         lastVideoId = videoId;
       }
 
-      // 2. Detect Play on Host
-      if (state === 1 && lastState !== 1) {
+      // 2. Detect Seek on Host (time jumped by more than 0.8s unexpectedly)
+      if (lastTime !== -1 && Math.abs(time - lastTime) > 0.8) {
+        console.log(`[YT-Sync] Poller detected seek: ${lastTime.toFixed(2)}s -> ${time.toFixed(2)}s`);
+        postToContent({
+          type: 'player-event',
+          action: 'seek',
+          videoId,
+          currentTime: time,
+          playbackRate: rate,
+          isPlaying: (state === 1),
+        });
+      }
+
+      // 3. Detect Play on Host
+      else if (state === 1 && lastState !== 1) {
         postToContent({
           type: 'player-event',
           action: 'play',
@@ -140,8 +256,8 @@
         });
       }
 
-      // 3. Detect Pause on Host
-      else if (state === 2 && lastState === 1) {
+      // 4. Detect Pause on Host (any transition to 2 from non-2)
+      else if (state === 2 && lastState !== 2) {
         postToContent({
           type: 'player-event',
           action: 'pause',
@@ -149,18 +265,6 @@
           currentTime: time,
           playbackRate: rate,
           isPlaying: false,
-        });
-      }
-
-      // 4. Detect Seek on Host
-      else if (lastTime !== -1 && Math.abs(time - lastTime) > 1.2 && (state === 1 || state === 2)) {
-        postToContent({
-          type: 'player-event',
-          action: 'seek',
-          videoId,
-          currentTime: time,
-          playbackRate: rate,
-          isPlaying: (state === 1),
         });
       }
 
@@ -304,9 +408,11 @@
         }
 
         case 'play': {
+          const video = getVideoElement();
           if (msg.currentTime !== undefined) {
             const curTime = video ? video.currentTime : player.getCurrentTime();
             if (Math.abs(curTime - msg.currentTime) > 0.08) {
+              if (video) video.currentTime = msg.currentTime;
               player.seekTo(msg.currentTime, true);
             }
           }
@@ -316,23 +422,37 @@
         }
 
         case 'pause': {
-          player.pauseVideo();
+          const video = getVideoElement();
+          if (video) video.pause();
+          if (player && typeof player.pauseVideo === 'function') {
+            player.pauseVideo();
+          }
           if (msg.currentTime !== undefined) {
-            player.seekTo(msg.currentTime, true);
+            if (video) video.currentTime = msg.currentTime;
+            if (player && typeof player.seekTo === 'function') {
+              player.seekTo(msg.currentTime, true);
+            }
           }
           setVideoRate(baseRate);
           break;
         }
 
         case 'seek': {
+          const video = getVideoElement();
           if (msg.currentTime !== undefined) {
-            player.seekTo(msg.currentTime, true);
+            if (video) video.currentTime = msg.currentTime;
+            if (player && typeof player.seekTo === 'function') {
+              player.seekTo(msg.currentTime, true);
+            }
           }
           setVideoRate(baseRate);
           if (msg.isPlaying) {
             startPlaybackSafe();
           } else {
-            player.pauseVideo();
+            if (video) video.pause();
+            if (player && typeof player.pauseVideo === 'function') {
+              player.pauseVideo();
+            }
           }
           break;
         }
@@ -414,21 +534,26 @@
       const baseRate = msg.playbackRate || 1.0;
 
       // 2. Play/Pause state alignment
-      if (msg.isPlaying && state !== 1 && state !== 3) {
+      if (!msg.isPlaying) {
+        // Host is paused — follower MUST be paused and at host's timestamp
+        if (state === 1 || state === 3) {
+          if (video) video.pause();
+          player.pauseVideo();
+        }
+        if (Math.abs(myTime - targetTime) > 0.08) {
+          if (video) video.currentTime = targetTime;
+          player.seekTo(targetTime, true);
+        }
+        setVideoRate(baseRate);
+        return;
+      } else if (state !== 1 && state !== 3) {
         // Host is playing but follower is not — start follower!
         if (Math.abs(myTime - targetTime) > 0.08) {
+          if (video) video.currentTime = targetTime;
           player.seekTo(targetTime, true);
         }
         setVideoRate(baseRate);
         startPlaybackSafe();
-        return;
-      } else if (!msg.isPlaying && (state === 1 || state === 3)) {
-        // Host is paused but follower is playing — pause follower!
-        player.pauseVideo();
-        if (Math.abs(myTime - targetTime) > 0.05) {
-          player.seekTo(targetTime, true);
-        }
-        setVideoRate(baseRate);
         return;
       }
 
@@ -446,6 +571,7 @@
         // B) Large discrepancy (> 350ms): Snap to host's position immediately
         if (absDrift > 0.350) {
           suppressEvents = true;
+          if (video) video.currentTime = targetTime;
           player.seekTo(targetTime, true);
           setVideoRate(baseRate);
           setTimeout(() => {
@@ -453,7 +579,7 @@
             lastState = player ? player.getPlayerState() : -1;
             const v = getVideoElement();
             lastTime = v ? v.currentTime : (player ? player.getCurrentTime() : -1);
-          }, 300);
+          }, 250);
           return;
         }
 

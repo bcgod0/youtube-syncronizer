@@ -288,10 +288,9 @@ function handleMessage(ws, msg) {
         if (client.rtt > maxRtt) maxRtt = client.rtt;
       }
 
-      // Half RTT is the delivery time from server to client.
-      // Pause is executed immediately; play/seek needs enough buffer so every client receives it.
-      const isInstantPause = (msg.action === 'pause');
-      const executionDelay = isInstantPause ? 0 : Math.max(40, Math.ceil(maxRtt / 2) + 40);
+      // Pause, seek, and video-change are executed immediately; play has minimal buffer
+      const isInstant = (msg.action === 'pause' || msg.action === 'seek' || msg.action === 'video-change');
+      const executionDelay = isInstant ? 0 : Math.max(30, Math.min(60, Math.ceil(maxRtt / 2) + 20));
       const serverExecuteAt = serverNow + executionDelay;
 
       const targetVideoTime = msg.currentTime ?? session.state.currentTime ?? 0;

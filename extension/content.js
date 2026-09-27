@@ -201,8 +201,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // ─── Sync Execution ─────────────────────────────────────────────
 
 function executeSyncAction(msg) {
+  const isInstant = (msg.action === 'pause' || msg.action === 'seek' || msg.action === 'video-change');
   const now = Date.now();
-  const delay = Math.max(0, (msg.executeAt || now) - now);
+  const delay = isInstant ? 0 : Math.max(0, Math.min(100, (msg.executeAt || now) - now));
 
   const runAction = () => {
     suppressEvents = true;
