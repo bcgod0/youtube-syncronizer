@@ -80,12 +80,18 @@ async function init() {
 // ─── Event Handlers ──────────────────────────────────────────────
 
 async function handleConnect() {
-  const serverUrl = els.serverUrl.value.trim();
+  let serverUrl = els.serverUrl.value.trim();
   const name = els.userName.value.trim() || 'User';
 
   if (!serverUrl) {
     showToast('Please enter a server URL', true);
     return;
+  }
+
+  // Auto-prepend wss:// if no protocol is specified
+  if (!serverUrl.startsWith('ws://') && !serverUrl.startsWith('wss://')) {
+    serverUrl = 'wss://' + serverUrl;
+    els.serverUrl.value = serverUrl;
   }
 
   // Save settings

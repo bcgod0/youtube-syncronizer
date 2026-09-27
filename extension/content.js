@@ -17,7 +17,7 @@ let isInSession = false;
 let isHost = false;
 let suppressEvents = false; // true while applying a sync action
 let positionReportTimer = null;
-const POSITION_REPORT_INTERVAL = 800; // ms — report frequently for fast drift correction
+const POSITION_REPORT_INTERVAL = 3000; // ms — report every 3s to avoid over-correcting on high latency
 
 // ─── Inject Page Script ─────────────────────────────────────────
 
@@ -164,11 +164,11 @@ function executeSyncAction(msg) {
       isPlaying: msg.isPlaying,
     });
 
-    // Re-enable event forwarding after a short delay
-    // to avoid echo of the action we just applied
+    // Re-enable event forwarding after enough time for the action to settle
+    // Must be longer than network RTT to avoid echo loops
     setTimeout(() => {
       suppressEvents = false;
-    }, 200);
+    }, 600);
   }, delay);
 }
 

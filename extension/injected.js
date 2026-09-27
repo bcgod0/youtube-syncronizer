@@ -193,12 +193,12 @@
       console.error('[YT-Sync] Error executing action:', e);
     }
 
-    // Re-enable events after a short delay
+    // Re-enable events after enough time for the action to settle
     setTimeout(() => {
       suppressEvents = false;
       lastState = player ? player.getPlayerState() : -1;
       lastTime = player ? player.getCurrentTime() : -1;
-    }, 200);
+    }, 800);
   }
 
   function applyFullState(msg) {
@@ -260,21 +260,22 @@
     }
   }
 
-  // ─── Drift Correction ─────────────────────────────────────────
-
   /**
-   * Drift correction strategy (tightened for near-zero delay):
+   * Drift correction strategy (tolerant of high-latency networks):
    * 
-   * < 15ms  → Perfect sync, restore normal rate
-   * 15-50ms → Proportional micro-adjustment (±1-3%)
-   * 50-200ms → Aggressive rate correction (±5-8%)
-   * > 200ms → Hard seek to correct position
+   * With 200-300ms RTT, measurement noise is significant.
+   * We must be conservative to avoid the correction feedback loop
+   * (correct → event fires → correct again → repeat).
    * 
-   * Rate adjustments are proportional to drift magnitude
-   * for smooth, continuous convergence.
+   * < 150ms  → Considered synced, no action needed
+   * 150ms-2s → Gentle playback rate adjustment (±2-3%)
+   * > 2s     → One-time hard seek, then cooldown
+   * 
+   * Corrections are debounced — minimum 2s between any two corrections.
    */
   let driftCorrectionTimer = null;
-  let consecutiveSynced = 0;
+  let lastCorrectionTime = 0;
+  const CORRECTION_COOLDOWN = 2000; // ms between corrections
 
   function handleDriftCorrection(msg) {
     if (!player) return;
@@ -283,46 +284,46 @@
       const isPlaying = player.getPlayerState() === 1;
       if (!isPlaying || !msg.isPlaying) return;
 
+      // Debounce: skip if we corrected recently
+      const now = Date.now();
+      if (now - lastCorrectionTime < CORRECTION_COOLDOWN) return;
+
       const myTime = player.getCurrentTime();
       const drift = myTime - msg.hostTime; // positive = we're ahead
       const absDrift = Math.abs(drift);
 
-      if (absDrift < 0.015) {
-        // Within 15ms — perfect sync
-        consecutiveSynced++;
-        if (consecutiveSynced >= 2) {
-          restorePlaybackRate(msg.playbackRate || 1);
-        }
+      if (absDrift < 0.15) {
+        // Within 150ms — close enough, restore normal rate
+        restorePlaybackRate(msg.playbackRate || 1);
         return;
       }
 
-      consecutiveSynced = 0;
+      lastCorrectionTime = now;
 
-      if (absDrift > 0.2) {
-        // Large drift (>200ms) — hard seek immediately
+      if (absDrift > 2.0) {
+        // Very large drift (>2s) — hard seek
         suppressEvents = true;
         player.seekTo(msg.hostTime, true);
         restorePlaybackRate(msg.playbackRate || 1);
-        setTimeout(() => { suppressEvents = false; }, 150);
+        setTimeout(() => { suppressEvents = false; }, 800);
         return;
       }
 
-      // Proportional rate correction — scales with drift magnitude
+      // Moderate drift (150ms - 2s) — gentle rate adjustment only
+      // Cap adjustment at ±3% to keep audio natural
       const baseRate = msg.playbackRate || 1;
-      // Map drift linearly: 15ms→1% adjustment, 200ms→8% adjustment
-      const adjustmentMagnitude = 0.01 + (absDrift - 0.015) * (0.07 / 0.185);
-      const adjustment = drift > 0 ? -adjustmentMagnitude : adjustmentMagnitude;
+      const adjustment = drift > 0 ? -0.03 : 0.03;
 
-      const correctedRate = Math.max(0.9, Math.min(1.1, baseRate + adjustment));
+      const correctedRate = baseRate + adjustment;
       if (player.setPlaybackRate) {
         player.setPlaybackRate(correctedRate);
       }
 
-      // Restore rate sooner for faster corrections
+      // Hold the adjusted rate for a while, then restore
       if (driftCorrectionTimer) clearTimeout(driftCorrectionTimer);
       driftCorrectionTimer = setTimeout(() => {
         restorePlaybackRate(baseRate);
-      }, 800);
+      }, 3000);
 
     } catch (e) {
       console.error('[YT-Sync] Drift correction error:', e);
