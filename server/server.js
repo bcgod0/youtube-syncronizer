@@ -165,6 +165,7 @@ function handleMessage(ws, msg) {
     // ── Session Management ──
     case 'create-session': {
       const code = generateSessionCode();
+      const serverNow = Date.now();
       const session = {
         clients: new Map(),
         state: {
@@ -172,7 +173,15 @@ function handleMessage(ws, msg) {
           currentTime: 0,
           isPlaying: false,
           playbackRate: 1,
-          lastUpdated: Date.now(),
+          lastUpdated: serverNow,
+        },
+        timeline: {
+          anchorServerTime: serverNow,
+          anchorVideoTime: 0,
+          isPlaying: false,
+          playbackRate: 1,
+          videoId: null,
+          version: 1,
         },
         hostId: ws._clientId,
       };
@@ -192,6 +201,7 @@ function handleMessage(ws, msg) {
         type: 'session-created',
         sessionCode: code,
         clientId: ws._clientId,
+        timeline: session.timeline,
         clients: getSessionClientList(session),
       });
 
@@ -224,12 +234,13 @@ function handleMessage(ws, msg) {
 
       session.clients.set(ws, clientInfo);
 
-      // Send current state to the joining client
+      // Send current state and canonical timeline to the joining client
       sendTo(ws, {
         type: 'session-joined',
         sessionCode: code,
         clientId: ws._clientId,
         state: session.state,
+        timeline: session.timeline,
         clients: getSessionClientList(session),
       });
 
@@ -256,72 +267,77 @@ function handleMessage(ws, msg) {
     // ── Playback Sync ──
     case 'sync-action': {
       /**
-       * A client performed a playback action. We schedule it across all
-       * clients at a coordinated wall-clock time.
-       *
-       * msg.action: 'play' | 'pause' | 'seek' | 'video-change'
-       * msg.videoId: string
-       * msg.currentTime: number (seconds)
-       * msg.playbackRate: number
+       * A client performed a playback action.
+       * We calculate the future execution time so all clients apply the action
+       * at the exact same physical millisecond.
        */
       const { sessionId, session } = findSessionByClient(ws);
       if (!session) return;
 
       const serverNow = Date.now();
 
-      // Calculate the maximum RTT in the session so we can set a safe execution time
+      // Find the maximum RTT in the session to guarantee delivery before execution
       let maxRtt = 0;
       for (const [, client] of session.clients) {
         if (client.rtt > maxRtt) maxRtt = client.rtt;
       }
 
-      // Schedule the action in the future with enough buffer for all clients
-      // Full RTT + buffer ensures even the slowest client receives the command in time
-      const executionDelay = Math.max(50, maxRtt + 50);
+      // Half RTT is the delivery time from server to client.
+      // Pause is executed immediately; play/seek needs enough buffer so every client receives it.
+      const isInstantPause = (msg.action === 'pause');
+      const executionDelay = isInstantPause ? 0 : Math.max(40, Math.ceil(maxRtt / 2) + 40);
       const serverExecuteAt = serverNow + executionDelay;
 
-      // Update session state
+      const targetVideoTime = msg.currentTime ?? session.state.currentTime ?? 0;
+      const isPlaying = (msg.action === 'play') ? true :
+                        (msg.action === 'pause') ? false :
+                        (msg.isPlaying ?? session.state.isPlaying);
+      const playbackRate = msg.playbackRate ?? session.state.playbackRate ?? 1;
+      const videoId = msg.videoId || session.state.videoId || null;
+
+      session.timeline = {
+        anchorServerTime: serverExecuteAt,
+        anchorVideoTime: targetVideoTime,
+        isPlaying,
+        playbackRate,
+        videoId,
+        version: ((session.timeline && session.timeline.version) || 0) + 1,
+      };
+
       session.state = {
-        videoId: msg.videoId || session.state.videoId,
-        currentTime: msg.currentTime ?? session.state.currentTime,
-        isPlaying: msg.action === 'play' ? true :
-                   msg.action === 'pause' ? false :
-                   session.state.isPlaying,
-        playbackRate: msg.playbackRate ?? session.state.playbackRate,
+        videoId,
+        currentTime: targetVideoTime,
+        isPlaying,
+        playbackRate,
         lastUpdated: serverNow,
       };
 
-      // Broadcast to ALL clients (including sender for consistency)
+      // Broadcast to ALL clients (including sender) with coordinated execution time
       for (const [clientWs, client] of session.clients) {
-        // Convert server execution time to this client's local clock
-        // clientTime = serverTime + clockOffset
         const clientExecuteAt = serverExecuteAt + client.clockOffset;
 
         sendTo(clientWs, {
           type: 'sync-execute',
           action: msg.action,
-          videoId: session.state.videoId,
-          currentTime: msg.currentTime ?? session.state.currentTime,
-          playbackRate: session.state.playbackRate,
-          isPlaying: session.state.isPlaying,
+          videoId,
+          currentTime: targetVideoTime,
+          playbackRate,
+          isPlaying,
           executeAt: clientExecuteAt, // in the client's local clock
+          timeline: session.timeline,
           sourceClientId: ws._clientId,
         });
       }
 
-      console.log(`[▶] ${msg.action} in session ${sessionId} by ${ws._clientId} | schedDelay=${executionDelay}ms`);
+      console.log(`[▶] ${msg.action} in session ${sessionId} by ${ws._clientId} | delay=${executionDelay}ms pos=${targetVideoTime.toFixed(2)}s`);
       break;
     }
 
     // ── Heartbeat / Position Report ──
     case 'position-report': {
       /**
-       * Periodic position report from a client.
-       * Used for drift correction across the session.
-       * 
-       * msg.currentTime: number (seconds)
-       * msg.isPlaying: boolean
-       * msg.timestamp: client local timestamp when position was read
+       * Periodic position report from client.
+       * Used to anchor the reference timeline with zero transit delay.
        */
       const { sessionId, session } = findSessionByClient(ws);
       if (!session) return;
@@ -329,34 +345,41 @@ function handleMessage(ws, msg) {
       const client = session.clients.get(ws);
       if (!client) return;
 
-      // Store the latest position info on the client
+      const clientTimestamp = msg.timestamp || msg.clientTimestamp;
       client.lastPosition = msg.currentTime;
-      client.lastPositionTimestamp = msg.timestamp;
+      client.lastPositionTimestamp = clientTimestamp;
       client.lastPositionServerTime = Date.now();
 
-      // If this is the host, update session state and broadcast corrections
+      // If this is the host, update the canonical timeline
       if (client.isHost) {
+        // Translate client's sampling timestamp to server wall-clock time
+        // serverTime = clientTime - clockOffset
+        const hostServerTime = clientTimestamp
+          ? (clientTimestamp - client.clockOffset)
+          : (Date.now() - Math.round(client.rtt / 2));
+
         session.state.currentTime = msg.currentTime;
         session.state.isPlaying = msg.isPlaying;
         session.state.lastUpdated = Date.now();
 
-        // Send drift-correction to non-host clients
-        for (const [clientWs, otherClient] of session.clients) {
+        if (!session.timeline) {
+          session.timeline = { version: 0 };
+        }
+        session.timeline.anchorServerTime = hostServerTime;
+        session.timeline.anchorVideoTime = msg.currentTime;
+        session.timeline.isPlaying = msg.isPlaying;
+        session.timeline.playbackRate = msg.playbackRate || session.state.playbackRate || 1;
+        if (msg.videoId) session.timeline.videoId = msg.videoId;
+        session.timeline.version++;
+
+        // Broadcast timeline-update to non-host clients
+        for (const [clientWs] of session.clients) {
           if (clientWs === ws) continue; // skip host
 
-          // Calculate where the host's playback position is RIGHT NOW
-          // (accounting for time elapsed since the host reported)
-          const elapsed = (Date.now() - client.lastPositionServerTime) / 1000;
-          const hostCurrentTime = msg.isPlaying
-            ? msg.currentTime + elapsed * (session.state.playbackRate || 1)
-            : msg.currentTime;
-
           sendTo(clientWs, {
-            type: 'drift-correction',
-            hostTime: hostCurrentTime,
-            isPlaying: msg.isPlaying,
-            playbackRate: session.state.playbackRate,
-            serverTimestamp: Date.now(),
+            type: 'timeline-update',
+            timeline: session.timeline,
+            serverNow: Date.now(),
           });
         }
       }

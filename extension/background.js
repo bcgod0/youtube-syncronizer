@@ -167,6 +167,13 @@ function handleClockSyncResponse(msg) {
       rtt: clockRtt,
     });
 
+    // Send clock offset update to content scripts for precise local timeline calculation
+    broadcastToContentScripts({
+      type: 'clock-offset-update',
+      clockOffset: Math.round(clockOffset),
+      clockRtt: Math.round(clockRtt),
+    });
+
     console.log(`[BG] Clock sync #${clockSyncCount}: offset=${clockOffset.toFixed(1)}ms, RTT=${clockRtt}ms`);
   }
 }
@@ -187,6 +194,8 @@ function handleServerMessage(msg) {
         sessionCode,
         clientId,
         clients: msg.clients,
+        timeline: msg.timeline,
+        clockOffset: Math.round(clockOffset),
         isHost: true,
       });
       broadcastConnectionStatus();
@@ -201,6 +210,8 @@ function handleServerMessage(msg) {
         clientId,
         clients: msg.clients,
         state: msg.state,
+        timeline: msg.timeline,
+        clockOffset: Math.round(clockOffset),
         isHost: false,
       });
       broadcastConnectionStatus();
@@ -228,7 +239,7 @@ function handleServerMessage(msg) {
       break;
 
     case 'sync-execute':
-      // Forward to content scripts for execution
+      // Forward to content scripts for execution with timeline anchor
       broadcastToContentScripts({
         type: 'sync-execute',
         action: msg.action,
@@ -237,16 +248,18 @@ function handleServerMessage(msg) {
         playbackRate: msg.playbackRate,
         isPlaying: msg.isPlaying,
         executeAt: msg.executeAt,
+        timeline: msg.timeline,
+        clockOffset: Math.round(clockOffset),
         sourceClientId: msg.sourceClientId,
       });
       break;
 
-    case 'drift-correction':
+    case 'timeline-update':
       broadcastToContentScripts({
-        type: 'drift-correction',
-        hostTime: msg.hostTime,
-        isPlaying: msg.isPlaying,
-        playbackRate: msg.playbackRate,
+        type: 'timeline-update',
+        timeline: msg.timeline,
+        serverNow: msg.serverNow,
+        clockOffset: Math.round(clockOffset),
       });
       break;
 
@@ -356,7 +369,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         type: 'position-report',
         currentTime: msg.currentTime,
         isPlaying: msg.isPlaying,
-        timestamp: Date.now(),
+        playbackRate: msg.playbackRate,
+        videoId: msg.videoId,
+        clientTimestamp: msg.clientTimestamp || Date.now(),
       });
       return false;
 

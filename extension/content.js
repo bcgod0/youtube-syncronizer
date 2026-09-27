@@ -15,9 +15,9 @@
 
 let isInSession = false;
 let isHost = false;
-let suppressEvents = false; // true while applying a sync action
+let suppressEvents = false;
 let positionReportTimer = null;
-const POSITION_REPORT_INTERVAL = 3000; // ms — report every 3s to avoid over-correcting on high latency
+const POSITION_REPORT_INTERVAL = 2500; // ms — report every 2.5s for reference timeline freshness
 
 // ─── Inject Page Script ─────────────────────────────────────────
 
@@ -43,7 +43,7 @@ window.addEventListener('message', (event) => {
       // Player fired a state change or seek
       if (!isInSession || suppressEvents) return;
 
-      const { action, videoId, currentTime, playbackRate } = msg;
+      const { action, videoId, currentTime, playbackRate, isPlaying } = msg;
 
       // Forward to background → server
       chrome.runtime.sendMessage({
@@ -52,12 +52,25 @@ window.addEventListener('message', (event) => {
         videoId,
         currentTime,
         playbackRate,
+        isPlaying,
       });
       break;
     }
 
     case 'player-ready': {
       console.log('[YT-Sync] YouTube player detected');
+      // Ask background for current status in case session is already joined
+      chrome.runtime.sendMessage({ type: 'get-status' }, (response) => {
+        if (response && response.isConnected && response.sessionCode) {
+          isInSession = true;
+          sendToInjected({
+            type: 'session-status',
+            isInSession: true,
+            isHost: false,
+            clockOffset: response.clockOffset,
+          });
+        }
+      });
       break;
     }
 
@@ -68,6 +81,9 @@ window.addEventListener('message', (event) => {
         type: 'position-report',
         currentTime: msg.currentTime,
         isPlaying: msg.isPlaying,
+        playbackRate: msg.playbackRate,
+        videoId: msg.videoId,
+        clientTimestamp: msg.clientTimestamp || Date.now(),
       });
       break;
     }
@@ -86,12 +102,45 @@ function sendToInjected(message) {
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   switch (msg.type) {
 
+    case 'clock-offset-update': {
+      sendToInjected({
+        type: 'clock-offset-update',
+        clockOffset: msg.clockOffset,
+        clockRtt: msg.clockRtt,
+      });
+      break;
+    }
+
+    case 'connection-status': {
+      if (msg.clockOffset !== undefined) {
+        sendToInjected({
+          type: 'clock-offset-update',
+          clockOffset: msg.clockOffset,
+          clockRtt: msg.clockRtt,
+        });
+      }
+      break;
+    }
+
     case 'session-update': {
       isInSession = true;
       isHost = msg.isHost;
 
-      // If joining with existing state, apply it
-      if (msg.state && msg.state.videoId) {
+      sendToInjected({
+        type: 'session-status',
+        isInSession: true,
+        isHost: msg.isHost,
+        timeline: msg.timeline,
+        clockOffset: msg.clockOffset,
+      });
+
+      if (msg.timeline) {
+        sendToInjected({
+          type: 'timeline-update',
+          timeline: msg.timeline,
+          clockOffset: msg.clockOffset,
+        });
+      } else if (msg.state && msg.state.videoId) {
         applyState(msg.state);
       }
 
@@ -103,6 +152,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     case 'session-left': {
       isInSession = false;
       isHost = false;
+      sendToInjected({
+        type: 'session-status',
+        isInSession: false,
+        isHost: false,
+      });
       stopPositionReporting();
       showNotification('Left the sync session');
       break;
@@ -110,6 +164,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     case 'promoted-to-host': {
       isHost = true;
+      sendToInjected({
+        type: 'session-status',
+        isInSession: true,
+        isHost: true,
+      });
+      startPositionReporting();
       showNotification('You are now the session host');
       break;
     }
@@ -133,8 +193,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       break;
     }
 
-    case 'drift-correction': {
-      applyDriftCorrection(msg);
+    case 'timeline-update': {
+      sendToInjected({
+        type: 'timeline-update',
+        timeline: msg.timeline,
+        serverNow: msg.serverNow,
+        clockOffset: msg.clockOffset,
+      });
       break;
     }
 
@@ -149,10 +214,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 function executeSyncAction(msg) {
   const now = Date.now();
-  const delay = Math.max(0, msg.executeAt - now);
+  const delay = Math.max(0, (msg.executeAt || now) - now);
 
-  // Schedule the action at the precise time
-  setTimeout(() => {
+  const runAction = () => {
     suppressEvents = true;
 
     sendToInjected({
@@ -162,14 +226,19 @@ function executeSyncAction(msg) {
       currentTime: msg.currentTime,
       playbackRate: msg.playbackRate,
       isPlaying: msg.isPlaying,
+      timeline: msg.timeline,
     });
 
-    // Re-enable event forwarding after enough time for the action to settle
-    // Must be longer than network RTT to avoid echo loops
     setTimeout(() => {
       suppressEvents = false;
-    }, 600);
-  }, delay);
+    }, 400);
+  };
+
+  if (delay <= 0) {
+    runAction();
+  } else {
+    setTimeout(runAction, delay);
+  }
 }
 
 function applyState(state) {
@@ -188,23 +257,13 @@ function applyState(state) {
   }, 1000);
 }
 
-// ─── Drift Correction ───────────────────────────────────────────
-
-function applyDriftCorrection(msg) {
-  if (isHost) return; // host is the source of truth
-
-  sendToInjected({
-    type: 'drift-correction',
-    hostTime: msg.hostTime,
-    isPlaying: msg.isPlaying,
-    playbackRate: msg.playbackRate,
-  });
-}
-
 // ─── Position Reporting ─────────────────────────────────────────
 
 function startPositionReporting() {
   stopPositionReporting();
+  // Only the host reports position for session sync anchor
+  if (!isHost) return;
+
   positionReportTimer = setInterval(() => {
     sendToInjected({ type: 'get-position' });
   }, POSITION_REPORT_INTERVAL);
