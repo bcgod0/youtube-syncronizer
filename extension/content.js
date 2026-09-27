@@ -2,13 +2,13 @@
  * Content Script
  * 
  * Injected into YouTube pages. Bridges between the page's YouTube player
- * (via injected.js) and the background service worker.
+ * (via injected.js in world: MAIN) and the background service worker.
  * 
  * Responsibilities:
- * - Injects injected.js into the page context for YouTube API access
- * - Listens for player events from injected.js
+ * - Listens for authoritative player events from injected.js
  * - Receives sync commands from background.js and forwards to injected.js
- * - Sends periodic position reports for drift correction
+ * - Sends periodic position reports from host for transit-compensated drift correction
+ * - Periodically syncs session state for 100% resilient connection recovery
  */
 
 // ─── State ───────────────────────────────────────────────────────
@@ -17,18 +17,7 @@ let isInSession = false;
 let isHost = false;
 let suppressEvents = false;
 let positionReportTimer = null;
-const POSITION_REPORT_INTERVAL = 1000; // ms — 1s heartbeat from host keeps all devices locked
-
-// ─── Inject Page Script ─────────────────────────────────────────
-
-function injectPageScript() {
-  const script = document.createElement('script');
-  script.src = chrome.runtime.getURL('injected.js');
-  script.onload = () => script.remove();
-  (document.head || document.documentElement).appendChild(script);
-}
-
-injectPageScript();
+const POSITION_REPORT_INTERVAL = 1000; // ms — 1s heartbeat from host
 
 // ─── Communication with injected.js (via window.postMessage) ────
 
@@ -58,31 +47,14 @@ window.addEventListener('message', (event) => {
     }
 
     case 'player-ready': {
-      console.log('[YT-Sync] YouTube player detected');
-      // Ask background for current status in case session is already joined
-      chrome.runtime.sendMessage({ type: 'get-status' }, (response) => {
-        if (response && response.isConnected && response.sessionCode) {
-          isInSession = true;
-          isHost = (response.isHost === true);
-          sendToInjected({
-            type: 'session-status',
-            isInSession: true,
-            isHost: isHost,
-          });
-          if (!isHost && response.state && response.state.videoId) {
-            applyState(response.state);
-          }
-          if (isHost) {
-            startPositionReporting();
-          }
-        }
-      });
+      // YouTube player detected or responded to ping
+      syncSessionStatus();
       break;
     }
 
     case 'position-response': {
-      // Response to our position query
-      if (!isInSession) return;
+      // Heartbeat position from host player
+      if (!isInSession || !isHost) return;
       chrome.runtime.sendMessage({
         type: 'position-report',
         currentTime: msg.currentTime,
@@ -103,6 +75,60 @@ function sendToInjected(message) {
   }, '*');
 }
 
+// ─── Session State Synchronization ──────────────────────────────
+
+function syncSessionStatus() {
+  chrome.runtime.sendMessage({ type: 'get-status' }, (response) => {
+    if (chrome.runtime.lastError) return;
+    if (response && response.isConnected && response.sessionCode) {
+      const wasInSession = isInSession;
+      const wasHost = isHost;
+
+      isInSession = true;
+      isHost = (response.isHost === true);
+
+      sendToInjected({
+        type: 'session-status',
+        isInSession: true,
+        isHost: isHost,
+      });
+
+      if (!isHost && response.state && response.state.videoId) {
+        if (!wasInSession) {
+          applyState(response.state);
+        }
+      }
+
+      if (isHost) {
+        startPositionReporting();
+      } else {
+        stopPositionReporting();
+      }
+    } else {
+      if (isInSession) {
+        isInSession = false;
+        isHost = false;
+        sendToInjected({
+          type: 'session-status',
+          isInSession: false,
+          isHost: false,
+        });
+        stopPositionReporting();
+      }
+    }
+  });
+}
+
+// Startup handshake and periodic sync check
+syncSessionStatus();
+sendToInjected({ type: 'ping' });
+
+// Poll every 2.5s so tabs recover effortlessly from SPA navigation or background reconnects
+setInterval(() => {
+  syncSessionStatus();
+  sendToInjected({ type: 'ping' });
+}, 2500);
+
 // ─── Messages from Background ───────────────────────────────────
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -110,15 +136,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     case 'session-update': {
       isInSession = true;
-      isHost = msg.isHost;
+      isHost = (msg.isHost === true);
 
       sendToInjected({
         type: 'session-status',
         isInSession: true,
-        isHost: msg.isHost,
+        isHost: isHost,
       });
 
-      // Always apply state on joining non-host clients
+      // Apply initial state for non-host clients
       if (!isHost && msg.state && msg.state.videoId) {
         applyState(msg.state);
       }
@@ -129,7 +155,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         stopPositionReporting();
       }
 
-      showNotification(`Joined session ${msg.sessionCode}`);
+      showNotification(`Connected to session ${msg.sessionCode}`);
       break;
     }
 
@@ -203,7 +229,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 function executeSyncAction(msg) {
   const isInstant = (msg.action === 'pause' || msg.action === 'seek' || msg.action === 'video-change');
   const now = Date.now();
-  const delay = isInstant ? 0 : Math.max(0, Math.min(100, (msg.executeAt || now) - now));
+  const delay = isInstant ? 0 : Math.max(0, Math.min(80, (msg.executeAt || now) - now));
 
   const runAction = () => {
     suppressEvents = true;
@@ -250,10 +276,9 @@ function applyState(state) {
 
 function startPositionReporting() {
   stopPositionReporting();
-  // Only the host reports position for session sync anchor
   if (!isHost) return;
 
-  // Query immediately so server state is primed without delay
+  // Immediate reading for instant anchor
   sendToInjected({ type: 'get-position' });
 
   positionReportTimer = setInterval(() => {
@@ -271,7 +296,6 @@ function stopPositionReporting() {
 // ─── UI Notification ─────────────────────────────────────────────
 
 function showNotification(text, isError = false) {
-  // Remove existing notification
   const existing = document.getElementById('yt-sync-notification');
   if (existing) existing.remove();
 
@@ -302,28 +326,14 @@ function showNotification(text, isError = false) {
 
   document.body.appendChild(el);
 
-  // Animate in
   requestAnimationFrame(() => {
     el.style.transform = 'translateY(0)';
     el.style.opacity = '1';
   });
 
-  // Animate out
   setTimeout(() => {
     el.style.transform = 'translateY(-10px)';
     el.style.opacity = '0';
     setTimeout(() => el.remove(), 400);
   }, 3000);
 }
-
-// ─── Handle YouTube SPA Navigation ──────────────────────────────
-
-let lastUrl = location.href;
-const observer = new MutationObserver(() => {
-  if (location.href !== lastUrl) {
-    lastUrl = location.href;
-    // Re-inject on SPA navigation
-    setTimeout(injectPageScript, 1000);
-  }
-});
-observer.observe(document.body, { childList: true, subtree: true });

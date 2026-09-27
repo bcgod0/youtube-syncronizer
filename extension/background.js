@@ -303,12 +303,20 @@ function handleServerMessage(msg) {
 // ─── Content Script Communication ───────────────────────────────
 
 function broadcastToContentScripts(message) {
-  chrome.tabs.query({}, (tabs) => {
-    if (!tabs) return;
-    for (const tab of tabs) {
-      if (!tab.url || tab.url.includes('youtube.com')) {
+  chrome.tabs.query({ url: ['*://*.youtube.com/*', '*://youtube.com/*'] }, (tabs) => {
+    if (tabs && tabs.length > 0) {
+      for (const tab of tabs) {
         chrome.tabs.sendMessage(tab.id, message).catch(() => {});
       }
+    } else {
+      chrome.tabs.query({}, (allTabs) => {
+        if (!allTabs) return;
+        for (const tab of allTabs) {
+          if (!tab.url || tab.url.includes('youtube.com')) {
+            chrome.tabs.sendMessage(tab.id, message).catch(() => {});
+          }
+        }
+      });
     }
   });
 }
@@ -447,15 +455,22 @@ setInterval(() => {
   }
 }, 25000);
 
-// Auto-inject content script into open YouTube tabs upon extension install/reload
+// Auto-inject scripts into open YouTube tabs upon extension install/reload
 chrome.runtime.onInstalled.addListener(() => {
   chrome.tabs.query({ url: ['*://*.youtube.com/*', '*://youtube.com/*'] }, (tabs) => {
     if (!tabs) return;
     for (const tab of tabs) {
       chrome.scripting.executeScript({
         target: { tabId: tab.id },
-        files: ['content.js']
+        files: ['injected.js'],
+        world: 'MAIN',
+      }).catch(() => {});
+
+      chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        files: ['content.js'],
       }).catch(() => {});
     }
   });
 });
+

@@ -23,7 +23,16 @@
         "*://youtube.com/*"
       ],
       "js": ["content.js"],
-      "run_at": "document_idle"
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "*://*.youtube.com/*",
+        "*://youtube.com/*"
+      ],
+      "js": ["injected.js"],
+      "world": "MAIN",
+      "run_at": "document_start"
     }
   ],
   "action": {
