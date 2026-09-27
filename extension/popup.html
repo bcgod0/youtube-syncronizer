@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>YouTube Sync</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="popup-container">
+    <!-- Header -->
+    <header class="header">
+      <div class="logo-group">
+        <div class="logo-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+            <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 14.5v-9l6 4.5-6 4.5z" fill="url(#logoGrad)"/>
+            <defs>
+              <linearGradient id="logoGrad" x1="2" y1="2" x2="22" y2="22">
+                <stop offset="0%" stop-color="#a78bfa"/>
+                <stop offset="100%" stop-color="#ec4899"/>
+              </linearGradient>
+            </defs>
+          </svg>
+        </div>
+        <h1 class="logo-text">YT Sync</h1>
+      </div>
+      <div class="connection-indicator" id="connectionDot" title="Disconnected">
+        <span class="dot"></span>
+      </div>
+    </header>
+
+    <!-- Connection Panel -->
+    <section id="connectPanel" class="panel">
+      <div class="input-group">
+        <label for="serverUrl">Server URL</label>
+        <input type="text" id="serverUrl" value="ws://localhost:8765" placeholder="ws://your-server:8765" spellcheck="false">
+      </div>
+      <div class="input-group">
+        <label for="userName">Your Name</label>
+        <input type="text" id="userName" placeholder="Enter your name" maxlength="20" spellcheck="false">
+      </div>
+      <button class="btn btn-primary" id="connectBtn">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M5 12h14M12 5l7 7-7 7"/>
+        </svg>
+        Connect
+      </button>
+    </section>
+
+    <!-- Session Panel (shown after connecting) -->
+    <section id="sessionPanel" class="panel hidden">
+      <div class="session-actions">
+        <button class="btn btn-primary" id="createSessionBtn">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="10"/><path d="M12 8v8M8 12h8"/>
+          </svg>
+          Create Session
+        </button>
+        <div class="divider-text">or</div>
+        <div class="input-group">
+          <label for="joinCode">Session Code</label>
+          <input type="text" id="joinCode" placeholder="ABC123" maxlength="6" spellcheck="false" style="text-transform: uppercase; letter-spacing: 3px; text-align: center; font-weight: 600;">
+        </div>
+        <button class="btn btn-secondary" id="joinSessionBtn">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4M10 17l5-5-5-5M15 12H3"/>
+          </svg>
+          Join Session
+        </button>
+      </div>
+      <button class="btn btn-ghost btn-small" id="disconnectBtn">Disconnect</button>
+    </section>
+
+    <!-- Active Session Panel -->
+    <section id="activePanel" class="panel hidden">
+      <div class="session-info">
+        <div class="session-code-display">
+          <span class="label">Session Code</span>
+          <div class="code-box" id="sessionCodeDisplay">------</div>
+          <button class="btn btn-icon" id="copyCodeBtn" title="Copy code">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+            </svg>
+          </button>
+        </div>
+
+        <div class="sync-stats">
+          <div class="stat">
+            <span class="stat-label">Latency</span>
+            <span class="stat-value" id="latencyValue">--</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Offset</span>
+            <span class="stat-value" id="offsetValue">--</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Status</span>
+            <span class="stat-value sync-good" id="syncStatus">Synced</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="members-section">
+        <h3 class="section-title">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+          </svg>
+          Members
+        </h3>
+        <ul class="members-list" id="membersList">
+          <!-- Populated dynamically -->
+        </ul>
+      </div>
+
+      <button class="btn btn-danger btn-small" id="leaveSessionBtn">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/>
+        </svg>
+        Leave Session
+      </button>
+    </section>
+
+    <!-- Error Toast -->
+    <div class="toast hidden" id="toast"></div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
