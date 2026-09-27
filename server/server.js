@@ -169,10 +169,10 @@ function handleMessage(ws, msg) {
       const session = {
         clients: new Map(),
         state: {
-          videoId: null,
-          currentTime: 0,
-          isPlaying: false,
-          playbackRate: 1,
+          videoId: msg.videoId || null,
+          currentTime: msg.currentTime || 0,
+          isPlaying: !!msg.isPlaying,
+          playbackRate: msg.playbackRate || 1,
           lastUpdated: serverNow,
         },
         timeline: {
@@ -361,12 +361,13 @@ function handleMessage(ws, msg) {
         session.state.currentTime = msg.currentTime;
         session.state.isPlaying = msg.isPlaying;
         if (msg.videoId) session.state.videoId = msg.videoId;
+        if (msg.playbackRate) session.state.playbackRate = msg.playbackRate;
         session.state.lastUpdated = Date.now();
 
         // Translate host's reading timestamp to server wall-clock time
-        const hostServerTime = clientTimestamp
+        const hostServerTime = (clientTimestamp && typeof client.clockOffset === 'number')
           ? (clientTimestamp - client.clockOffset)
-          : (Date.now() - Math.round(client.rtt / 2));
+          : (Date.now() - Math.round((client.rtt || 0) / 2));
 
         const now = Date.now();
 
@@ -374,10 +375,12 @@ function handleMessage(ws, msg) {
         for (const [clientWs, otherClient] of session.clients) {
           if (clientWs === ws) continue; // skip host
 
-          // When this packet arrives at otherClient, arrivalServerTime = now + (otherClient.rtt / 2)
-          // Elapsed since host read its position = (arrivalServerTime - hostServerTime)
-          const arrivalServerTime = now + Math.round(otherClient.rtt / 2);
-          const elapsedSec = Math.max(0, (arrivalServerTime - hostServerTime) / 1000);
+          const arrivalServerTime = now + Math.round((otherClient.rtt || 0) / 2);
+          let elapsedSec = (arrivalServerTime - hostServerTime) / 1000;
+          // Clamp bounds (0s to 1.5s) to guard against any temporary clock skew spikes
+          if (elapsedSec < 0 || elapsedSec > 1.5) {
+            elapsedSec = Math.max(0, ((otherClient.rtt || 50) + (client.rtt || 50)) / 2000);
+          }
 
           const expectedTargetTime = msg.isPlaying
             ? msg.currentTime + (elapsedSec * (session.state.playbackRate || 1))

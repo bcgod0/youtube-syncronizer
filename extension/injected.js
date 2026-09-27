@@ -172,6 +172,12 @@
   }
 
   function getVideoId() {
+    // 1. YouTube player API (most reliable)
+    if (player && typeof player.getVideoData === 'function') {
+      const data = player.getVideoData();
+      if (data && data.video_id) return data.video_id;
+    }
+    // 2. URL parameters
     const urlParams = new URLSearchParams(window.location.search);
     const v = urlParams.get('v');
     if (v) return v;
@@ -181,9 +187,105 @@
     return '';
   }
 
+  // ─── Follower Video Synchronization Helper ───────────────────────
+
+  function syncFollowerVideo(targetVideoId, startTime) {
+    if (isHost || !targetVideoId) return false;
+    const curId = getVideoId();
+    if (curId === targetVideoId) return false;
+
+    console.log(`[YT-Sync] Follower transitioning to host video: ${targetVideoId} (from: "${curId}")`);
+    lastVideoId = targetVideoId;
+
+    // If player exists and supports loadVideoById, use it to avoid full page reload
+    if (player && typeof player.loadVideoById === 'function') {
+      try {
+        player.loadVideoById({
+          videoId: targetVideoId,
+          startSeconds: Math.floor(startTime || 0)
+        });
+        return true;
+      } catch (e) {
+        console.warn('[YT-Sync] loadVideoById error, falling back to location.href:', e);
+      }
+    }
+
+    // Direct URL navigation (works from homepage, search, or if player not loaded)
+    window.location.href = `https://www.youtube.com/watch?v=${targetVideoId}&t=${Math.floor(startTime || 0)}`;
+    return true;
+  }
+
+  // ─── Autoplay-Safe Playback ──────────────────────────────────────
+
+  function startPlaybackSafe() {
+    const video = getVideoElement();
+    if (video) {
+      const p = video.play();
+      if (p && p.catch) {
+        p.catch((err) => {
+          console.warn('[YT-Sync] Autoplay blocked with sound:', err.message);
+          // Mute and play so follower synchronizes immediately
+          video.muted = true;
+          video.play().catch(() => {});
+          showAutoplayNotice();
+        });
+      }
+    }
+    if (player && typeof player.playVideo === 'function') {
+      try {
+        player.playVideo();
+      } catch (e) {}
+    }
+  }
+
+  function showAutoplayNotice() {
+    if (document.getElementById('yt-sync-unmute-notice')) return;
+    const notice = document.createElement('div');
+    notice.id = 'yt-sync-unmute-notice';
+    notice.innerHTML = `
+      <div style="display:flex;align-items:center;gap:8px;">
+        <span style="font-size:18px;">🔊</span>
+        <span>Click anywhere to unmute synchronized audio</span>
+      </div>
+    `;
+    Object.assign(notice.style, {
+      position: 'fixed',
+      bottom: '80px',
+      right: '24px',
+      zIndex: '999999',
+      padding: '12px 20px',
+      borderRadius: '12px',
+      fontFamily: "'Inter', system-ui, sans-serif",
+      fontSize: '14px',
+      fontWeight: '600',
+      color: '#fff',
+      background: 'linear-gradient(135deg, #a78bfa 0%, #7c3aed 100%)',
+      boxShadow: '0 8px 32px rgba(0,0,0,0.4)',
+      cursor: 'pointer',
+      transition: 'all 0.3s ease',
+    });
+    const unmute = () => {
+      const v = getVideoElement();
+      if (v) v.muted = false;
+      notice.remove();
+      window.removeEventListener('click', unmute, true);
+    };
+    notice.addEventListener('click', unmute);
+    window.addEventListener('click', unmute, true);
+    document.body.appendChild(notice);
+  }
+
   // ─── Remote Action Execution (FOLLOWERS EXECUTE HOST ACTIONS) ────
 
   function executeAction(msg) {
+    // HOST NEVER EXECUTES FOLLOWER/REMOTE ACTIONS!
+    if (isHost) return;
+
+    // 1. First ensure follower is on the host's video!
+    if (msg.videoId && syncFollowerVideo(msg.videoId, msg.currentTime || 0)) {
+      return;
+    }
+
     if (!player) player = findPlayer();
     if (!player) return;
 
@@ -193,17 +295,10 @@
       const video = getVideoElement();
       const baseRate = msg.playbackRate || 1;
 
-      // Ensure follower is on the host's video
-      if (msg.videoId && msg.videoId !== getVideoId()) {
-        console.log(`[YT-Sync] Follower switching to host video: ${msg.videoId}`);
-        window.location.href = `https://www.youtube.com/watch?v=${msg.videoId}&t=${Math.floor(msg.currentTime || 0)}`;
-        return;
-      }
-
       switch (msg.action) {
         case 'video-change': {
-          if (msg.videoId && msg.videoId !== getVideoId()) {
-            window.location.href = `https://www.youtube.com/watch?v=${msg.videoId}`;
+          if (msg.videoId) {
+            syncFollowerVideo(msg.videoId, 0);
           }
           break;
         }
@@ -211,12 +306,12 @@
         case 'play': {
           if (msg.currentTime !== undefined) {
             const curTime = video ? video.currentTime : player.getCurrentTime();
-            if (Math.abs(curTime - msg.currentTime) > 0.05) {
+            if (Math.abs(curTime - msg.currentTime) > 0.08) {
               player.seekTo(msg.currentTime, true);
             }
           }
           setVideoRate(baseRate);
-          player.playVideo();
+          startPlaybackSafe();
           break;
         }
 
@@ -235,7 +330,7 @@
           }
           setVideoRate(baseRate);
           if (msg.isPlaying) {
-            player.playVideo();
+            startPlaybackSafe();
           } else {
             player.pauseVideo();
           }
@@ -255,32 +350,33 @@
   }
 
   function applyFullState(msg) {
+    if (isHost) return;
+
+    // 1. Ensure follower matches host video
+    if (msg.videoId && syncFollowerVideo(msg.videoId, msg.currentTime || 0)) {
+      return;
+    }
+
     if (!player) player = findPlayer();
     if (!player) {
-      setTimeout(() => applyFullState(msg), 800);
+      setTimeout(() => applyFullState(msg), 500);
       return;
     }
 
     suppressEvents = true;
 
     try {
-      if (msg.videoId && msg.videoId !== getVideoId()) {
-        console.log(`[YT-Sync] Joining session: navigating to host video ${msg.videoId}`);
-        window.location.href = `https://www.youtube.com/watch?v=${msg.videoId}&t=${Math.floor(msg.currentTime || 0)}`;
-        return;
-      }
-
       if (msg.currentTime !== undefined) {
         player.seekTo(msg.currentTime, true);
       }
 
+      setVideoRate(msg.playbackRate || 1);
+
       if (msg.isPlaying) {
-        player.playVideo();
+        startPlaybackSafe();
       } else {
         player.pauseVideo();
       }
-
-      setVideoRate(msg.playbackRate || 1);
     } catch (e) {
       console.error('[YT-Sync] Error applying state:', e);
     }
@@ -297,74 +393,82 @@
 
   function handleDriftCorrection(msg) {
     // Only followers follow the host!
-    if (!player || isHost || suppressEvents) return;
+    if (isHost || suppressEvents) return;
     if (isAdPlaying()) return;
 
-    try {
-      // 1. Follower must match host's video
-      const currentVideoId = getVideoId();
-      if (msg.videoId && currentVideoId && msg.videoId !== currentVideoId) {
-        console.log(`[YT-Sync] Follower on wrong video (${currentVideoId} != ${msg.videoId}). Switching!`);
-        window.location.href = `https://www.youtube.com/watch?v=${msg.videoId}&t=${Math.floor(msg.targetTime || 0)}`;
-        return;
-      }
+    // 1. Follower MUST match host video (run BEFORE checking player)
+    if (msg.videoId && syncFollowerVideo(msg.videoId, msg.targetTime || 0)) {
+      return;
+    }
 
+    if (!player) player = findPlayer();
+    if (!player) return;
+
+    try {
       const state = player.getPlayerState();
       const video = getVideoElement();
       const myTime = video ? video.currentTime : player.getCurrentTime();
       const targetTime = msg.targetTime !== undefined ? msg.targetTime : msg.hostTime;
       if (targetTime === undefined || targetTime < 0) return;
 
+      const baseRate = msg.playbackRate || 1.0;
+
       // 2. Play/Pause state alignment
       if (msg.isPlaying && state !== 1 && state !== 3) {
         // Host is playing but follower is not — start follower!
-        player.seekTo(targetTime, true);
-        player.playVideo();
+        if (Math.abs(myTime - targetTime) > 0.08) {
+          player.seekTo(targetTime, true);
+        }
+        setVideoRate(baseRate);
+        startPlaybackSafe();
         return;
-      } else if (!msg.isPlaying && state === 1) {
+      } else if (!msg.isPlaying && (state === 1 || state === 3)) {
         // Host is paused but follower is playing — pause follower!
         player.pauseVideo();
-        player.seekTo(targetTime, true);
+        if (Math.abs(myTime - targetTime) > 0.05) {
+          player.seekTo(targetTime, true);
+        }
+        setVideoRate(baseRate);
         return;
       }
 
       // 3. Both are playing — measure drift
-      const drift = myTime - targetTime; // positive = ahead, negative = behind
-      const absDrift = Math.abs(drift);
-      const baseRate = msg.playbackRate || 1.0;
+      if (msg.isPlaying && state === 1) {
+        const drift = myTime - targetTime; // positive = follower ahead, negative = follower behind
+        const absDrift = Math.abs(drift);
 
-      // A) Within 15ms: In phase! Perfect sync.
-      if (absDrift < 0.015) {
-        setVideoRate(baseRate);
-        return;
+        // A) Within 15ms: In phase! Perfect sync.
+        if (absDrift < 0.015) {
+          setVideoRate(baseRate);
+          return;
+        }
+
+        // B) Large discrepancy (> 350ms): Snap to host's position immediately
+        if (absDrift > 0.350) {
+          suppressEvents = true;
+          player.seekTo(targetTime, true);
+          setVideoRate(baseRate);
+          setTimeout(() => {
+            suppressEvents = false;
+            lastState = player ? player.getPlayerState() : -1;
+            const v = getVideoElement();
+            lastTime = v ? v.currentTime : (player ? player.getCurrentTime() : -1);
+          }, 300);
+          return;
+        }
+
+        // C) Micro-drift (15ms to 350ms): Smooth proportional rate adjustment (±1% - ±5%)
+        // Seamlessly slides follower into lockstep without audio cutouts or buffering
+        const adjustment = Math.min(0.05, Math.max(0.01, absDrift * 0.15));
+        const correctedRate = drift > 0 ? (baseRate - adjustment) : (baseRate + adjustment);
+
+        setVideoRate(correctedRate);
+
+        if (driftCorrectionTimer) clearTimeout(driftCorrectionTimer);
+        driftCorrectionTimer = setTimeout(() => {
+          setVideoRate(baseRate);
+        }, 1000);
       }
-
-      // B) Large discrepancy (> 250ms): Snap to host's position immediately
-      if (absDrift > 0.250) {
-        suppressEvents = true;
-        player.seekTo(targetTime, true);
-        setVideoRate(baseRate);
-        setTimeout(() => {
-          suppressEvents = false;
-          lastState = player ? player.getPlayerState() : -1;
-          const v = getVideoElement();
-          lastTime = v ? v.currentTime : (player ? player.getCurrentTime() : -1);
-        }, 300);
-        return;
-      }
-
-      // C) Micro-drift (15ms to 250ms): Smooth proportional rate adjustment (±1% - ±4%)
-      // Seamlessly slides follower into lockstep without audio cutouts or buffering
-      const adjustment = Math.min(0.04, Math.max(0.01, absDrift * 0.20));
-      const correctedRate = drift > 0 ? (baseRate - adjustment) : (baseRate + adjustment);
-
-      setVideoRate(correctedRate);
-
-      if (driftCorrectionTimer) clearTimeout(driftCorrectionTimer);
-      driftCorrectionTimer = setTimeout(() => {
-        setVideoRate(baseRate);
-      }, 1000);
-
     } catch (e) {
       console.error('[YT-Sync] Drift correction error:', e);
     }
@@ -373,7 +477,12 @@
   // ─── Host Heartbeat Reporting ───────────────────────────────────
 
   function reportPosition() {
-    if (!player || !isHost) return;
+    if (!isHost) return;
+    if (!player) player = findPlayer();
+    if (!player) return;
+
+    // If tab is hidden and paused, don't report (avoids background tab interference)
+    if (document.hidden && player.getPlayerState() !== 1) return;
 
     try {
       const video = getVideoElement();
@@ -392,6 +501,13 @@
       // ignore
     }
   }
+
+  // Autonomous 1-second heartbeat when host is active
+  setInterval(() => {
+    if (isHost && isInSession) {
+      reportPosition();
+    }
+  }, 1000);
 
   // ─── Messages from Content Script ───────────────────────────────
 
@@ -422,6 +538,9 @@
         isInSession = !!msg.isInSession;
         isHost = !!msg.isHost;
         lastVideoId = getVideoId();
+        if (isHost && isInSession) {
+          setTimeout(reportPosition, 100);
+        }
         if (!isInSession) {
           setVideoRate(1.0);
         }

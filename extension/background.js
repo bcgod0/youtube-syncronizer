@@ -266,6 +266,12 @@ function handleServerMessage(msg) {
       break;
 
     case 'drift-correction':
+      sessionState = {
+        videoId: msg.videoId,
+        currentTime: msg.targetTime,
+        isPlaying: msg.isPlaying,
+        playbackRate: msg.playbackRate,
+      };
       broadcastToContentScripts({
         type: 'drift-correction',
         videoId: msg.videoId,
@@ -290,10 +296,12 @@ function handleServerMessage(msg) {
 // ─── Content Script Communication ───────────────────────────────
 
 function broadcastToContentScripts(message) {
-  chrome.tabs.query({ url: ['*://www.youtube.com/*', '*://youtube.com/*', '*://m.youtube.com/*'] }, (tabs) => {
+  chrome.tabs.query({}, (tabs) => {
     if (!tabs) return;
     for (const tab of tabs) {
-      chrome.tabs.sendMessage(tab.id, message).catch(() => {});
+      if (!tab.url || tab.url.includes('youtube.com')) {
+        chrome.tabs.sendMessage(tab.id, message).catch(() => {});
+      }
     }
   });
 }
@@ -351,7 +359,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     case 'create-session':
       clientName = msg.name || clientName;
-      sendToServer({ type: 'create-session', name: clientName });
+      sendToServer({
+        type: 'create-session',
+        name: clientName,
+        videoId: sessionState ? sessionState.videoId : null,
+        currentTime: sessionState ? sessionState.currentTime : 0,
+        isPlaying: sessionState ? sessionState.isPlaying : false,
+      });
       sendResponse({ ok: true });
       return true;
 
@@ -376,11 +390,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         videoId: msg.videoId,
         currentTime: msg.currentTime,
         playbackRate: msg.playbackRate,
+        isPlaying: msg.isPlaying,
       });
       sendResponse({ ok: true });
       return true;
 
     case 'position-report':
+      if (isHost) {
+        sessionState = {
+          videoId: msg.videoId,
+          currentTime: msg.currentTime,
+          isPlaying: msg.isPlaying,
+          playbackRate: msg.playbackRate,
+        };
+      }
       sendToServer({
         type: 'position-report',
         currentTime: msg.currentTime,

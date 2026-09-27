@@ -173,6 +173,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
 
     case 'sync-execute': {
+      if (isHost) return;
       executeSyncAction(msg);
       break;
     }
@@ -250,6 +251,9 @@ function startPositionReporting() {
   stopPositionReporting();
   // Only the host reports position for session sync anchor
   if (!isHost) return;
+
+  // Query immediately so server state is primed without delay
+  sendToInjected({ type: 'get-position' });
 
   positionReportTimer = setInterval(() => {
     sendToInjected({ type: 'get-position' });

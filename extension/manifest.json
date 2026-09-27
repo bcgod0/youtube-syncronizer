@@ -9,8 +9,8 @@
     "tabs"
   ],
   "host_permissions": [
-    "https://www.youtube.com/*",
-    "https://youtube.com/*"
+    "*://*.youtube.com/*",
+    "*://youtube.com/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -18,8 +18,8 @@
   "content_scripts": [
     {
       "matches": [
-        "https://www.youtube.com/*",
-        "https://youtube.com/*"
+        "*://*.youtube.com/*",
+        "*://youtube.com/*"
       ],
       "js": ["content.js"],
       "run_at": "document_idle"
@@ -41,7 +41,7 @@
   "web_accessible_resources": [
     {
       "resources": ["injected.js"],
-      "matches": ["https://www.youtube.com/*", "https://youtube.com/*"]
+      "matches": ["*://*.youtube.com/*", "*://youtube.com/*"]
     }
   ]
 }
