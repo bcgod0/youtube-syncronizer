@@ -9,7 +9,7 @@
 // ─── State ───────────────────────────────────────────────────────
 
 let ws = null;
-let serverUrl = 'ws://localhost:8765';
+let serverUrl = 'wss://youtube-syncronizer-production.up.railway.app';
 let sessionCode = null;
 let clientId = null;
 let clientName = 'User';

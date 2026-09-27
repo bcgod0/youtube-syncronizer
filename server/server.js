@@ -84,9 +84,26 @@ function findSessionByClient(ws) {
 
 // ─── Server ──────────────────────────────────────────────────────
 
-const wss = new WebSocketServer({ port: PORT });
+const http = require('http');
 
-console.log(`🎵 YouTube Sync Server running on ws://localhost:${PORT}`);
+// Create an HTTP server (required for Railway/cloud reverse proxies)
+const server = http.createServer((req, res) => {
+  // Health check endpoint
+  if (req.url === '/' || req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok', sessions: sessions.size }));
+  } else {
+    res.writeHead(404);
+    res.end();
+  }
+});
+
+// Attach WebSocket server to the HTTP server
+const wss = new WebSocketServer({ server });
+
+server.listen(PORT, () => {
+  console.log(`🎵 YouTube Sync Server running on port ${PORT}`);
+});
 
 wss.on('connection', (ws) => {
   const clientId = uuidv4().slice(0, 8);
