@@ -22,9 +22,10 @@ const RECONNECT_BASE_DELAY = 1000;
 let clockOffset = 0;       // our clock - server clock (ms)
 let clockRtt = Infinity;
 let clockSyncSamples = [];
-const CLOCK_SYNC_INTERVAL = 5000;  // re-sync every 5s
-const CLOCK_SYNC_SAMPLES = 5;      // samples per sync round
+const CLOCK_SYNC_INTERVAL = 2000;  // re-sync every 2s for tighter accuracy
+const CLOCK_SYNC_SAMPLES = 8;      // more samples = better offset estimate
 let clockSyncTimer = null;
+let clockSyncCount = 0;            // total sync rounds completed
 
 // ─── WebSocket Connection ────────────────────────────────────────
 
@@ -139,14 +140,25 @@ function handleClockSyncResponse(msg) {
   clockSyncSamples.push({ offset, rtt });
 
   if (clockSyncSamples.length < CLOCK_SYNC_SAMPLES) {
-    // Send another ping after a short delay
-    setTimeout(sendClockSyncPing, 50);
+    // Send another ping rapidly for burst measurement
+    setTimeout(sendClockSyncPing, 20);
   } else {
     // Pick the sample with the lowest RTT (most accurate)
     clockSyncSamples.sort((a, b) => a.rtt - b.rtt);
-    const best = clockSyncSamples[0];
-    clockOffset = best.offset;
-    clockRtt = best.rtt;
+    // Average the best 3 samples for stability
+    const bestN = clockSyncSamples.slice(0, 3);
+    const avgOffset = bestN.reduce((s, x) => s + x.offset, 0) / bestN.length;
+    const bestRtt = bestN[0].rtt;
+
+    // Exponential moving average to smooth offset across rounds
+    clockSyncCount++;
+    if (clockSyncCount <= 1) {
+      clockOffset = avgOffset;
+    } else {
+      // Weight new measurement 40%, history 60%
+      clockOffset = clockOffset * 0.6 + avgOffset * 0.4;
+    }
+    clockRtt = bestRtt;
 
     // Report to server
     sendToServer({
@@ -155,7 +167,7 @@ function handleClockSyncResponse(msg) {
       rtt: clockRtt,
     });
 
-    console.log(`[BG] Clock sync: offset=${clockOffset.toFixed(1)}ms, RTT=${clockRtt}ms`);
+    console.log(`[BG] Clock sync #${clockSyncCount}: offset=${clockOffset.toFixed(1)}ms, RTT=${clockRtt}ms`);
   }
 }
 
@@ -274,8 +286,8 @@ function broadcastConnectionStatus(errorMessage = null) {
   // Send to all YouTube tabs
   broadcastToContentScripts(status);
 
-  // Also respond to any pending popup queries
-  // (popup uses runtime.sendMessage which triggers onMessage)
+  // Send to popup (it lives in the extension context, not a tab)
+  chrome.runtime.sendMessage(status).catch(() => {});
 }
 
 // ─── Message Listener (from popup and content scripts) ──────────

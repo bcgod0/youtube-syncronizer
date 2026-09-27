@@ -193,12 +193,12 @@
       console.error('[YT-Sync] Error executing action:', e);
     }
 
-    // Re-enable events after a delay
+    // Re-enable events after a short delay
     setTimeout(() => {
       suppressEvents = false;
       lastState = player ? player.getPlayerState() : -1;
       lastTime = player ? player.getCurrentTime() : -1;
-    }, 500);
+    }, 200);
   }
 
   function applyFullState(msg) {
@@ -241,7 +241,7 @@
       suppressEvents = false;
       lastState = player ? player.getPlayerState() : -1;
       lastTime = player ? player.getCurrentTime() : -1;
-    }, 1000);
+    }, 500);
   }
 
   // ─── Position Reporting ────────────────────────────────────────
@@ -263,17 +263,18 @@
   // ─── Drift Correction ─────────────────────────────────────────
 
   /**
-   * Drift correction strategy:
+   * Drift correction strategy (tightened for near-zero delay):
    * 
-   * If the drift is small (< 100ms), adjust playback rate slightly
-   * (0.97x or 1.03x) to gradually converge. This is imperceptible.
+   * < 15ms  → Perfect sync, restore normal rate
+   * 15-50ms → Proportional micro-adjustment (±1-3%)
+   * 50-200ms → Aggressive rate correction (±5-8%)
+   * > 200ms → Hard seek to correct position
    * 
-   * If the drift is medium (100ms - 500ms), use a more aggressive rate
-   * adjustment (0.95x or 1.05x).
-   * 
-   * If the drift is large (> 500ms), do a hard seek to the correct position.
+   * Rate adjustments are proportional to drift magnitude
+   * for smooth, continuous convergence.
    */
   let driftCorrectionTimer = null;
+  let consecutiveSynced = 0;
 
   function handleDriftCorrection(msg) {
     if (!player) return;
@@ -284,44 +285,44 @@
 
       const myTime = player.getCurrentTime();
       const drift = myTime - msg.hostTime; // positive = we're ahead
+      const absDrift = Math.abs(drift);
 
-      if (Math.abs(drift) < 0.03) {
-        // Within 30ms — perfect sync, restore normal rate
-        restorePlaybackRate(msg.playbackRate || 1);
+      if (absDrift < 0.015) {
+        // Within 15ms — perfect sync
+        consecutiveSynced++;
+        if (consecutiveSynced >= 2) {
+          restorePlaybackRate(msg.playbackRate || 1);
+        }
         return;
       }
 
-      if (Math.abs(drift) > 0.5) {
-        // Large drift — hard seek
+      consecutiveSynced = 0;
+
+      if (absDrift > 0.2) {
+        // Large drift (>200ms) — hard seek immediately
         suppressEvents = true;
         player.seekTo(msg.hostTime, true);
         restorePlaybackRate(msg.playbackRate || 1);
-        setTimeout(() => { suppressEvents = false; }, 300);
+        setTimeout(() => { suppressEvents = false; }, 150);
         return;
       }
 
-      // Small/medium drift — adjust playback rate
+      // Proportional rate correction — scales with drift magnitude
       const baseRate = msg.playbackRate || 1;
-      let adjustment;
+      // Map drift linearly: 15ms→1% adjustment, 200ms→8% adjustment
+      const adjustmentMagnitude = 0.01 + (absDrift - 0.015) * (0.07 / 0.185);
+      const adjustment = drift > 0 ? -adjustmentMagnitude : adjustmentMagnitude;
 
-      if (Math.abs(drift) > 0.1) {
-        // Medium drift: aggressive correction
-        adjustment = drift > 0 ? -0.05 : 0.05;
-      } else {
-        // Small drift: gentle correction
-        adjustment = drift > 0 ? -0.02 : 0.02;
-      }
-
-      const correctedRate = baseRate + adjustment;
+      const correctedRate = Math.max(0.9, Math.min(1.1, baseRate + adjustment));
       if (player.setPlaybackRate) {
         player.setPlaybackRate(correctedRate);
       }
 
-      // Schedule rate restoration
+      // Restore rate sooner for faster corrections
       if (driftCorrectionTimer) clearTimeout(driftCorrectionTimer);
       driftCorrectionTimer = setTimeout(() => {
         restorePlaybackRate(baseRate);
-      }, 2000);
+      }, 800);
 
     } catch (e) {
       console.error('[YT-Sync] Drift correction error:', e);

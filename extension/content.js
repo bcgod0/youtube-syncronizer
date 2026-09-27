@@ -17,7 +17,7 @@ let isInSession = false;
 let isHost = false;
 let suppressEvents = false; // true while applying a sync action
 let positionReportTimer = null;
-const POSITION_REPORT_INTERVAL = 2000; // ms
+const POSITION_REPORT_INTERVAL = 800; // ms — report frequently for fast drift correction
 
 // ─── Inject Page Script ─────────────────────────────────────────
 
@@ -168,7 +168,7 @@ function executeSyncAction(msg) {
     // to avoid echo of the action we just applied
     setTimeout(() => {
       suppressEvents = false;
-    }, 500);
+    }, 200);
   }, delay);
 }
 

@@ -258,9 +258,9 @@ function handleMessage(ws, msg) {
         if (client.rtt > maxRtt) maxRtt = client.rtt;
       }
 
-      // Schedule the action in the future: max(50ms, maxRtt + 30ms buffer)
-      // This gives all clients enough time to receive and prepare the action
-      const executionDelay = Math.max(50, maxRtt + 30);
+      // Schedule the action in the future with minimal delay
+      // Use half-RTT + small buffer — just enough for message delivery
+      const executionDelay = Math.max(15, Math.ceil(maxRtt / 2) + 10);
       const serverExecuteAt = serverNow + executionDelay;
 
       // Update session state
