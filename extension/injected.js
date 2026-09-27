@@ -4,11 +4,11 @@
  * Runs in the YouTube page's own JS context.
  * Communicates with content.js via window.postMessage.
  *
- * Features:
- * - Detects play / pause / seek naturally
- * - Executes sync actions (play, pause, seek, video-change)
- * - Performs smooth micro-rate adjustments on HTML5 <video> for sub-15ms sync
- * - No infinite event feedback loops
+ * Master-Follower Architecture:
+ * - The HOST is the sole leader. Only the host broadcasts user actions (play, pause, seek, video-change).
+ * - ALL OTHER DEVICES are followers that strictly follow the host.
+ * - Followers automatically navigate to the host's video.
+ * - Continuous 1-second transit-compensated drift corrections lock audio within 15ms.
  */
 
 (function () {
@@ -22,6 +22,7 @@
   let player = null;
   let lastState = -1;
   let lastTime = -1;
+  let lastVideoId = '';
   let suppressEvents = false;
   let isHost = false;
   let isInSession = false;
@@ -59,10 +60,31 @@
 
   function initPlayer() {
     console.log('[YT-Sync] YouTube player ready');
+    lastVideoId = getVideoId();
     postToContent({ type: 'player-ready' });
 
     // Monitor playback state changes (every 200ms)
     setInterval(checkPlayerState, 200);
+
+    // Watch for in-page YouTube SPA navigations
+    window.addEventListener('yt-navigate-finish', onPageNavigated);
+  }
+
+  function onPageNavigated() {
+    if (!isInSession || !isHost) return;
+    const newId = getVideoId();
+    if (newId && newId !== lastVideoId) {
+      lastVideoId = newId;
+      console.log(`[YT-Sync] Host navigated to new video: ${newId}`);
+      postToContent({
+        type: 'player-event',
+        action: 'video-change',
+        videoId: newId,
+        currentTime: 0,
+        playbackRate: 1,
+        isPlaying: true,
+      });
+    }
   }
 
   // ─── Direct Playback Rate Control ───────────────────────────────
@@ -76,10 +98,11 @@
     }
   }
 
-  // ─── Player State Monitoring ────────────────────────────────────
+  // ─── Player State Monitoring (HOST ONLY) ─────────────────────────
 
   function checkPlayerState() {
-    if (!player || suppressEvents || !isInSession) return;
+    // Only the host broadcasts events. Followers only follow!
+    if (!player || suppressEvents || !isInSession || !isHost) return;
     if (isAdPlaying()) return;
 
     try {
@@ -89,7 +112,23 @@
       const videoId = getVideoId();
       const rate = player.getPlaybackRate ? player.getPlaybackRate() : 1;
 
-      // 1. Detect Play (transition to state 1 from any other state)
+      // 1. Detect Video Change on Host
+      if (videoId && lastVideoId && videoId !== lastVideoId) {
+        lastVideoId = videoId;
+        console.log(`[YT-Sync] Host changed video to: ${videoId}`);
+        postToContent({
+          type: 'player-event',
+          action: 'video-change',
+          videoId,
+          currentTime: time,
+          playbackRate: rate,
+          isPlaying: (state === 1),
+        });
+      } else if (videoId && !lastVideoId) {
+        lastVideoId = videoId;
+      }
+
+      // 2. Detect Play on Host
       if (state === 1 && lastState !== 1) {
         postToContent({
           type: 'player-event',
@@ -101,7 +140,7 @@
         });
       }
 
-      // 2. Detect Pause (transition to state 2 from state 1)
+      // 3. Detect Pause on Host
       else if (state === 2 && lastState === 1) {
         postToContent({
           type: 'player-event',
@@ -113,8 +152,8 @@
         });
       }
 
-      // 3. Detect Seek (jump in time while playing or paused)
-      else if (lastTime !== -1 && Math.abs(time - lastTime) > 1.5 && (state === 1 || state === 2)) {
+      // 4. Detect Seek on Host
+      else if (lastTime !== -1 && Math.abs(time - lastTime) > 1.2 && (state === 1 || state === 2)) {
         postToContent({
           type: 'player-event',
           action: 'seek',
@@ -134,28 +173,42 @@
 
   function getVideoId() {
     const urlParams = new URLSearchParams(window.location.search);
-    return urlParams.get('v') || '';
+    const v = urlParams.get('v');
+    if (v) return v;
+    if (window.location.pathname.startsWith('/shorts/')) {
+      return window.location.pathname.split('/')[2] || '';
+    }
+    return '';
   }
 
-  // ─── Action Execution (Remote Commands) ─────────────────────────
+  // ─── Remote Action Execution (FOLLOWERS EXECUTE HOST ACTIONS) ────
 
   function executeAction(msg) {
     if (!player) player = findPlayer();
     if (!player) return;
 
-    // Suppress local event detection while applying remote command
     suppressEvents = true;
 
     try {
       const video = getVideoElement();
       const baseRate = msg.playbackRate || 1;
 
+      // Ensure follower is on the host's video
+      if (msg.videoId && msg.videoId !== getVideoId()) {
+        console.log(`[YT-Sync] Follower switching to host video: ${msg.videoId}`);
+        window.location.href = `https://www.youtube.com/watch?v=${msg.videoId}&t=${Math.floor(msg.currentTime || 0)}`;
+        return;
+      }
+
       switch (msg.action) {
-        case 'play': {
+        case 'video-change': {
           if (msg.videoId && msg.videoId !== getVideoId()) {
-            window.location.href = `https://www.youtube.com/watch?v=${msg.videoId}&t=${Math.floor(msg.currentTime || 0)}`;
-            return;
+            window.location.href = `https://www.youtube.com/watch?v=${msg.videoId}`;
           }
+          break;
+        }
+
+        case 'play': {
           if (msg.currentTime !== undefined) {
             const curTime = video ? video.currentTime : player.getCurrentTime();
             if (Math.abs(curTime - msg.currentTime) > 0.05) {
@@ -188,19 +241,11 @@
           }
           break;
         }
-
-        case 'video-change': {
-          if (msg.videoId && msg.videoId !== getVideoId()) {
-            window.location.href = `https://www.youtube.com/watch?v=${msg.videoId}`;
-          }
-          break;
-        }
       }
     } catch (e) {
       console.error('[YT-Sync] Error executing action:', e);
     }
 
-    // Re-enable local event detection after YouTube state settles
     setTimeout(() => {
       suppressEvents = false;
       lastState = player ? player.getPlayerState() : -1;
@@ -220,6 +265,7 @@
 
     try {
       if (msg.videoId && msg.videoId !== getVideoId()) {
+        console.log(`[YT-Sync] Joining session: navigating to host video ${msg.videoId}`);
         window.location.href = `https://www.youtube.com/watch?v=${msg.videoId}&t=${Math.floor(msg.currentTime || 0)}`;
         return;
       }
@@ -247,33 +293,54 @@
     }, 600);
   }
 
-  // ─── Continuous Drift Correction ────────────────────────────────
+  // ─── Follower Drift Correction (FOLLOWER FOLLOWS HOST CLOCK) ─────
 
   function handleDriftCorrection(msg) {
+    // Only followers follow the host!
     if (!player || isHost || suppressEvents) return;
     if (isAdPlaying()) return;
 
     try {
-      const isPlaying = player.getPlayerState() === 1;
-      if (!isPlaying || !msg.isPlaying) return;
+      // 1. Follower must match host's video
+      const currentVideoId = getVideoId();
+      if (msg.videoId && currentVideoId && msg.videoId !== currentVideoId) {
+        console.log(`[YT-Sync] Follower on wrong video (${currentVideoId} != ${msg.videoId}). Switching!`);
+        window.location.href = `https://www.youtube.com/watch?v=${msg.videoId}&t=${Math.floor(msg.targetTime || 0)}`;
+        return;
+      }
 
+      const state = player.getPlayerState();
       const video = getVideoElement();
       const myTime = video ? video.currentTime : player.getCurrentTime();
-      const targetTime = msg.targetTime || msg.hostTime;
+      const targetTime = msg.targetTime !== undefined ? msg.targetTime : msg.hostTime;
       if (targetTime === undefined || targetTime < 0) return;
 
+      // 2. Play/Pause state alignment
+      if (msg.isPlaying && state !== 1 && state !== 3) {
+        // Host is playing but follower is not — start follower!
+        player.seekTo(targetTime, true);
+        player.playVideo();
+        return;
+      } else if (!msg.isPlaying && state === 1) {
+        // Host is paused but follower is playing — pause follower!
+        player.pauseVideo();
+        player.seekTo(targetTime, true);
+        return;
+      }
+
+      // 3. Both are playing — measure drift
       const drift = myTime - targetTime; // positive = ahead, negative = behind
       const absDrift = Math.abs(drift);
       const baseRate = msg.playbackRate || 1.0;
 
-      // 1. Within 15ms — virtually in phase, perfect sync!
+      // A) Within 15ms: In phase! Perfect sync.
       if (absDrift < 0.015) {
         setVideoRate(baseRate);
         return;
       }
 
-      // 2. Large desync (> 350ms) — quick seek to snap into place
-      if (absDrift > 0.350) {
+      // B) Large discrepancy (> 250ms): Snap to host's position immediately
+      if (absDrift > 0.250) {
         suppressEvents = true;
         player.seekTo(targetTime, true);
         setVideoRate(baseRate);
@@ -286,37 +353,39 @@
         return;
       }
 
-      // 3. Micro-drift (15ms - 350ms) — smooth proportional rate adjustment!
-      // Scale rate smoothly by ±0.8% to ±4.0%
-      const adjustment = Math.min(0.04, Math.max(0.008, absDrift * 0.20));
+      // C) Micro-drift (15ms to 250ms): Smooth proportional rate adjustment (±1% - ±4%)
+      // Seamlessly slides follower into lockstep without audio cutouts or buffering
+      const adjustment = Math.min(0.04, Math.max(0.01, absDrift * 0.20));
       const correctedRate = drift > 0 ? (baseRate - adjustment) : (baseRate + adjustment);
 
       setVideoRate(correctedRate);
 
-      // Restore base rate after 1.2s to smoothly level off
       if (driftCorrectionTimer) clearTimeout(driftCorrectionTimer);
       driftCorrectionTimer = setTimeout(() => {
         setVideoRate(baseRate);
-      }, 1200);
+      }, 1000);
 
     } catch (e) {
       console.error('[YT-Sync] Drift correction error:', e);
     }
   }
 
-  // ─── Position Reporting ────────────────────────────────────────
+  // ─── Host Heartbeat Reporting ───────────────────────────────────
 
   function reportPosition() {
-    if (!player) return;
+    if (!player || !isHost) return;
 
     try {
       const video = getVideoElement();
+      const videoId = getVideoId();
+      if (!videoId) return;
+
       postToContent({
         type: 'position-response',
         currentTime: video ? video.currentTime : player.getCurrentTime(),
         isPlaying: player.getPlayerState() === 1,
         playbackRate: player.getPlaybackRate ? player.getPlaybackRate() : 1,
-        videoId: getVideoId(),
+        videoId,
         clientTimestamp: Date.now(),
       });
     } catch (e) {
@@ -352,6 +421,7 @@
       case 'session-status':
         isInSession = !!msg.isInSession;
         isHost = !!msg.isHost;
+        lastVideoId = getVideoId();
         if (!isInSession) {
           setVideoRate(1.0);
         }

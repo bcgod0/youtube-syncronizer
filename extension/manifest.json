@@ -5,7 +5,8 @@
   "description": "Synchronize YouTube playback across multiple devices for a multi-speaker experience.",
   "permissions": [
     "storage",
-    "activeTab"
+    "activeTab",
+    "tabs"
   ],
   "host_permissions": [
     "https://www.youtube.com/*",

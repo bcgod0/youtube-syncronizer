@@ -267,12 +267,18 @@ function handleMessage(ws, msg) {
     // ── Playback Sync ──
     case 'sync-action': {
       /**
-       * A client performed a playback action.
-       * We calculate the future execution time so all clients apply the action
-       * at the exact same physical millisecond.
+       * Host performed a playback action (play, pause, seek, video-change).
+       * All other devices follow the host.
        */
       const { sessionId, session } = findSessionByClient(ws);
       if (!session) return;
+
+      const client = session.clients.get(ws);
+      // Only the host controls playback in the session
+      if (!client || !client.isHost) {
+        console.log(`[!] Ignored sync-action from non-host client ${ws._clientId}`);
+        return;
+      }
 
       const serverNow = Date.now();
 
@@ -379,6 +385,7 @@ function handleMessage(ws, msg) {
 
           sendTo(clientWs, {
             type: 'drift-correction',
+            videoId: session.state.videoId,
             targetTime: expectedTargetTime,
             hostTime: expectedTargetTime,
             isPlaying: msg.isPlaying,

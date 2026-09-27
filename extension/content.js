@@ -17,7 +17,7 @@ let isInSession = false;
 let isHost = false;
 let suppressEvents = false;
 let positionReportTimer = null;
-const POSITION_REPORT_INTERVAL = 2500; // ms — report every 2.5s for reference timeline freshness
+const POSITION_REPORT_INTERVAL = 1000; // ms — 1s heartbeat from host keeps all devices locked
 
 // ─── Inject Page Script ─────────────────────────────────────────
 
@@ -40,8 +40,8 @@ window.addEventListener('message', (event) => {
 
   switch (msg.type) {
     case 'player-event': {
-      // Player fired a state change or seek
-      if (!isInSession || suppressEvents) return;
+      // ONLY the host broadcasts player actions! Followers follow the host.
+      if (!isInSession || !isHost || suppressEvents) return;
 
       const { action, videoId, currentTime, playbackRate, isPlaying } = msg;
 
@@ -181,6 +181,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (isHost) return;
       sendToInjected({
         type: 'drift-correction',
+        videoId: msg.videoId,
         targetTime: msg.targetTime,
         hostTime: msg.hostTime,
         isPlaying: msg.isPlaying,

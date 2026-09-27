@@ -268,6 +268,7 @@ function handleServerMessage(msg) {
     case 'drift-correction':
       broadcastToContentScripts({
         type: 'drift-correction',
+        videoId: msg.videoId,
         targetTime: msg.targetTime,
         hostTime: msg.hostTime,
         isPlaying: msg.isPlaying,
@@ -289,7 +290,8 @@ function handleServerMessage(msg) {
 // ─── Content Script Communication ───────────────────────────────
 
 function broadcastToContentScripts(message) {
-  chrome.tabs.query({ url: ['https://www.youtube.com/*', 'https://youtube.com/*'] }, (tabs) => {
+  chrome.tabs.query({ url: ['*://www.youtube.com/*', '*://youtube.com/*', '*://m.youtube.com/*'] }, (tabs) => {
+    if (!tabs) return;
     for (const tab of tabs) {
       chrome.tabs.sendMessage(tab.id, message).catch(() => {});
     }
