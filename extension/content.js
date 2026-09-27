@@ -63,12 +63,18 @@ window.addEventListener('message', (event) => {
       chrome.runtime.sendMessage({ type: 'get-status' }, (response) => {
         if (response && response.isConnected && response.sessionCode) {
           isInSession = true;
+          isHost = (response.isHost === true);
           sendToInjected({
             type: 'session-status',
             isInSession: true,
-            isHost: false,
-            clockOffset: response.clockOffset,
+            isHost: isHost,
           });
+          if (!isHost && response.state && response.state.videoId) {
+            applyState(response.state);
+          }
+          if (isHost) {
+            startPositionReporting();
+          }
         }
       });
       break;
@@ -102,26 +108,6 @@ function sendToInjected(message) {
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   switch (msg.type) {
 
-    case 'clock-offset-update': {
-      sendToInjected({
-        type: 'clock-offset-update',
-        clockOffset: msg.clockOffset,
-        clockRtt: msg.clockRtt,
-      });
-      break;
-    }
-
-    case 'connection-status': {
-      if (msg.clockOffset !== undefined) {
-        sendToInjected({
-          type: 'clock-offset-update',
-          clockOffset: msg.clockOffset,
-          clockRtt: msg.clockRtt,
-        });
-      }
-      break;
-    }
-
     case 'session-update': {
       isInSession = true;
       isHost = msg.isHost;
@@ -130,21 +116,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         type: 'session-status',
         isInSession: true,
         isHost: msg.isHost,
-        timeline: msg.timeline,
-        clockOffset: msg.clockOffset,
       });
 
-      if (msg.timeline) {
-        sendToInjected({
-          type: 'timeline-update',
-          timeline: msg.timeline,
-          clockOffset: msg.clockOffset,
-        });
-      } else if (msg.state && msg.state.videoId) {
+      // Always apply state on joining non-host clients
+      if (!isHost && msg.state && msg.state.videoId) {
         applyState(msg.state);
       }
 
-      startPositionReporting();
+      if (isHost) {
+        startPositionReporting();
+      } else {
+        stopPositionReporting();
+      }
+
       showNotification(`Joined session ${msg.sessionCode}`);
       break;
     }
@@ -193,12 +177,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       break;
     }
 
-    case 'timeline-update': {
+    case 'drift-correction': {
+      if (isHost) return;
       sendToInjected({
-        type: 'timeline-update',
-        timeline: msg.timeline,
-        serverNow: msg.serverNow,
-        clockOffset: msg.clockOffset,
+        type: 'drift-correction',
+        targetTime: msg.targetTime,
+        hostTime: msg.hostTime,
+        isPlaying: msg.isPlaying,
+        playbackRate: msg.playbackRate,
       });
       break;
     }

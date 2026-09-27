@@ -304,8 +304,9 @@ function handleMessage(ws, msg) {
         version: ((session.timeline && session.timeline.version) || 0) + 1,
       };
 
+      // Update session state
       session.state = {
-        videoId,
+        videoId: videoId || session.state.videoId,
         currentTime: targetVideoTime,
         isPlaying,
         playbackRate,
@@ -319,12 +320,11 @@ function handleMessage(ws, msg) {
         sendTo(clientWs, {
           type: 'sync-execute',
           action: msg.action,
-          videoId,
+          videoId: session.state.videoId,
           currentTime: targetVideoTime,
           playbackRate,
           isPlaying,
           executeAt: clientExecuteAt, // in the client's local clock
-          timeline: session.timeline,
           sourceClientId: ws._clientId,
         });
       }
@@ -337,7 +337,7 @@ function handleMessage(ws, msg) {
     case 'position-report': {
       /**
        * Periodic position report from client.
-       * Used to anchor the reference timeline with zero transit delay.
+       * Used to compute transit-compensated drift corrections for non-host clients.
        */
       const { sessionId, session } = findSessionByClient(ws);
       if (!session) return;
@@ -350,36 +350,40 @@ function handleMessage(ws, msg) {
       client.lastPositionTimestamp = clientTimestamp;
       client.lastPositionServerTime = Date.now();
 
-      // If this is the host, update the canonical timeline
+      // If this is the host, update session state and broadcast transit-compensated target time
       if (client.isHost) {
-        // Translate client's sampling timestamp to server wall-clock time
-        // serverTime = clientTime - clockOffset
+        session.state.currentTime = msg.currentTime;
+        session.state.isPlaying = msg.isPlaying;
+        if (msg.videoId) session.state.videoId = msg.videoId;
+        session.state.lastUpdated = Date.now();
+
+        // Translate host's reading timestamp to server wall-clock time
         const hostServerTime = clientTimestamp
           ? (clientTimestamp - client.clockOffset)
           : (Date.now() - Math.round(client.rtt / 2));
 
-        session.state.currentTime = msg.currentTime;
-        session.state.isPlaying = msg.isPlaying;
-        session.state.lastUpdated = Date.now();
+        const now = Date.now();
 
-        if (!session.timeline) {
-          session.timeline = { version: 0 };
-        }
-        session.timeline.anchorServerTime = hostServerTime;
-        session.timeline.anchorVideoTime = msg.currentTime;
-        session.timeline.isPlaying = msg.isPlaying;
-        session.timeline.playbackRate = msg.playbackRate || session.state.playbackRate || 1;
-        if (msg.videoId) session.timeline.videoId = msg.videoId;
-        session.timeline.version++;
-
-        // Broadcast timeline-update to non-host clients
-        for (const [clientWs] of session.clients) {
+        // Broadcast drift-correction to non-host clients with exact transit compensation
+        for (const [clientWs, otherClient] of session.clients) {
           if (clientWs === ws) continue; // skip host
 
+          // When this packet arrives at otherClient, arrivalServerTime = now + (otherClient.rtt / 2)
+          // Elapsed since host read its position = (arrivalServerTime - hostServerTime)
+          const arrivalServerTime = now + Math.round(otherClient.rtt / 2);
+          const elapsedSec = Math.max(0, (arrivalServerTime - hostServerTime) / 1000);
+
+          const expectedTargetTime = msg.isPlaying
+            ? msg.currentTime + (elapsedSec * (session.state.playbackRate || 1))
+            : msg.currentTime;
+
           sendTo(clientWs, {
-            type: 'timeline-update',
-            timeline: session.timeline,
-            serverNow: Date.now(),
+            type: 'drift-correction',
+            targetTime: expectedTargetTime,
+            hostTime: expectedTargetTime,
+            isPlaying: msg.isPlaying,
+            playbackRate: session.state.playbackRate || 1,
+            serverTimestamp: now,
           });
         }
       }

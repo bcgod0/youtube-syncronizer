@@ -14,6 +14,8 @@ let sessionCode = null;
 let clientId = null;
 let clientName = 'User';
 let isConnected = false;
+let isHost = false;
+let sessionState = null;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 10;
 const RECONNECT_BASE_DELAY = 1000;
@@ -189,12 +191,13 @@ function handleServerMessage(msg) {
     case 'session-created':
       sessionCode = msg.sessionCode;
       clientId = msg.clientId;
+      isHost = true;
+      sessionState = null;
       broadcastToContentScripts({
         type: 'session-update',
         sessionCode,
         clientId,
         clients: msg.clients,
-        timeline: msg.timeline,
         clockOffset: Math.round(clockOffset),
         isHost: true,
       });
@@ -204,13 +207,14 @@ function handleServerMessage(msg) {
     case 'session-joined':
       sessionCode = msg.sessionCode;
       clientId = msg.clientId;
+      isHost = false;
+      sessionState = msg.state;
       broadcastToContentScripts({
         type: 'session-update',
         sessionCode,
         clientId,
         clients: msg.clients,
         state: msg.state,
-        timeline: msg.timeline,
         clockOffset: Math.round(clockOffset),
         isHost: false,
       });
@@ -219,6 +223,8 @@ function handleServerMessage(msg) {
 
     case 'session-left':
       sessionCode = null;
+      isHost = false;
+      sessionState = null;
       broadcastToContentScripts({ type: 'session-left' });
       broadcastConnectionStatus();
       break;
@@ -235,11 +241,18 @@ function handleServerMessage(msg) {
       break;
 
     case 'promoted-to-host':
+      isHost = true;
       broadcastToContentScripts({ type: 'promoted-to-host' });
       break;
 
     case 'sync-execute':
-      // Forward to content scripts for execution with timeline anchor
+      sessionState = {
+        videoId: msg.videoId,
+        currentTime: msg.currentTime,
+        isPlaying: msg.isPlaying,
+        playbackRate: msg.playbackRate,
+      };
+      // Forward to content scripts for execution
       broadcastToContentScripts({
         type: 'sync-execute',
         action: msg.action,
@@ -248,18 +261,17 @@ function handleServerMessage(msg) {
         playbackRate: msg.playbackRate,
         isPlaying: msg.isPlaying,
         executeAt: msg.executeAt,
-        timeline: msg.timeline,
-        clockOffset: Math.round(clockOffset),
         sourceClientId: msg.sourceClientId,
       });
       break;
 
-    case 'timeline-update':
+    case 'drift-correction':
       broadcastToContentScripts({
-        type: 'timeline-update',
-        timeline: msg.timeline,
-        serverNow: msg.serverNow,
-        clockOffset: Math.round(clockOffset),
+        type: 'drift-correction',
+        targetTime: msg.targetTime,
+        hostTime: msg.hostTime,
+        isPlaying: msg.isPlaying,
+        playbackRate: msg.playbackRate,
       });
       break;
 
@@ -314,6 +326,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sessionCode,
         clientId,
         clientName,
+        isHost,
+        state: sessionState,
         clockOffset: Math.round(clockOffset),
         clockRtt: Math.round(clockRtt),
         serverUrl,

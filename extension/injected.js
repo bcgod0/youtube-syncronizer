@@ -1,21 +1,19 @@
 /**
  * Injected Page Script
  *
- * Runs in the YouTube page's own JS context with direct access to:
- * 1. The YouTube Player API (document.getElementById('movie_player'))
- * 2. The HTML5 <video> element (for high-precision micro-playbackRate adjustments)
+ * Runs in the YouTube page's own JS context.
+ * Communicates with content.js via window.postMessage.
  *
- * Architecture:
- * - Maintains an authoritative wall-clock anchored reference timeline
- * - Evaluates drift against server wall-clock time (zero network transit delay)
- * - Proportional playbackRate micro-adjustments for smooth, imperceptible audio sync (< 10ms)
- * - Coordinated pre-roll starts so all devices fire the first beat in perfect unison
+ * Features:
+ * - Detects play / pause / seek naturally
+ * - Executes sync actions (play, pause, seek, video-change)
+ * - Performs smooth micro-rate adjustments on HTML5 <video> for sub-15ms sync
+ * - No infinite event feedback loops
  */
 
 (function () {
   'use strict';
 
-  // Avoid double-injection
   if (window.__ytSyncInjected) return;
   window.__ytSyncInjected = true;
 
@@ -25,14 +23,11 @@
   let lastState = -1;
   let lastTime = -1;
   let suppressEvents = false;
-
-  // Session & synchronization state
-  let isInSession = false;
   let isHost = false;
-  let clockOffset = 0; // clientClock - serverClock in ms
-  let timeline = null; // { anchorServerTime, anchorVideoTime, isPlaying, playbackRate, videoId, version }
+  let isInSession = false;
+  let driftCorrectionTimer = null;
 
-  // ─── Find YouTube Player & Video Element ────────────────────────
+  // ─── Find YouTube Player & Video ───────────────────────────────
 
   function findPlayer() {
     if (document.getElementById('movie_player')) {
@@ -63,107 +58,25 @@
   }
 
   function initPlayer() {
-    console.log('[YT-Sync] Player found, initializing high-precision sync engine');
-
+    console.log('[YT-Sync] YouTube player ready');
     postToContent({ type: 'player-ready' });
 
-    // Monitor user interaction (play/pause/seek)
+    // Monitor playback state changes (every 200ms)
     setInterval(checkPlayerState, 200);
-
-    // High-precision continuous sync loop (every 80ms)
-    setInterval(runContinuousSync, 80);
   }
 
-  // ─── Playback Speed Controller ───────────────────────────────────
+  // ─── Direct Playback Rate Control ───────────────────────────────
 
-  /**
-   * Applies playback speed directly to the HTMLMediaElement.
-   * Chromium's HTMLMediaElement supports arbitrary fractional rates (e.g. 1.015, 0.985)
-   * with automatic pitch preservation (no chipmunk effect).
-   */
-  function applyPlaybackRate(rate) {
+  function setVideoRate(rate) {
     const video = getVideoElement();
     if (video) {
       if (Math.abs(video.playbackRate - rate) > 0.002) {
         video.playbackRate = rate;
       }
     }
-    if (player && typeof player.setPlaybackRate === 'function') {
-      try {
-        player.setPlaybackRate(rate);
-      } catch (e) {
-        // ignore if YouTube API only supports standard steps
-      }
-    }
   }
 
-  // ─── Reference Timeline Calculations ────────────────────────────
-
-  /**
-   * Calculates the exact mathematical target video time for this millisecond.
-   * Because currentServerTime is synced via NTP, this is 100% immune to network transit delay.
-   */
-  function getTargetVideoTime() {
-    if (!timeline) return null;
-    if (!timeline.isPlaying) return timeline.anchorVideoTime;
-
-    const currentServerTime = Date.now() - clockOffset;
-    const elapsed = (currentServerTime - timeline.anchorServerTime) / 1000;
-    return Math.max(0, timeline.anchorVideoTime + (elapsed * (timeline.playbackRate || 1.0)));
-  }
-
-  // ─── Continuous High-Precision Sync Loop ────────────────────────
-
-  function runContinuousSync() {
-    if (!isInSession || suppressEvents || !timeline || !player) return;
-
-    // The host is the reference source: always plays at normal base rate
-    if (isHost) {
-      const baseRate = timeline.playbackRate || 1.0;
-      applyPlaybackRate(baseRate);
-      return;
-    }
-
-    const state = player.getPlayerState();
-    // Only adjust when playing and not in ads
-    if (state !== 1 || !timeline.isPlaying || isAdPlaying()) return;
-
-    const video = getVideoElement();
-    const actualTime = video ? video.currentTime : player.getCurrentTime();
-    const targetTime = getTargetVideoTime();
-    if (targetTime === null || targetTime < 0) return;
-
-    const drift = actualTime - targetTime; // positive = ahead, negative = behind
-    const absDrift = Math.abs(drift);
-    const baseRate = timeline.playbackRate || 1.0;
-
-    // 1. TIGHT SYNC (< 12ms)
-    // Sound waves are practically in phase — human ear hears zero delay/echo
-    if (absDrift < 0.012) {
-      applyPlaybackRate(baseRate);
-      return;
-    }
-
-    // 2. LARGE DISCREPANCY (> 350ms)
-    // Hard seek only for major jumps (initial join or large seek)
-    if (absDrift > 0.350) {
-      suppressEvents = true;
-      player.seekTo(targetTime, true);
-      applyPlaybackRate(baseRate);
-      setTimeout(() => { suppressEvents = false; }, 300);
-      return;
-    }
-
-    // 3. MICRO-DRIFT (12ms to 350ms)
-    // Smooth Proportional Control: adjust playback speed by ±0.8% to ±5.5%
-    // Zero audio dropouts, zero buffering, zero stutter!
-    const adjustment = Math.min(0.055, Math.max(0.008, absDrift * 0.22));
-    const newRate = drift > 0 ? (baseRate - adjustment) : (baseRate + adjustment);
-
-    applyPlaybackRate(newRate);
-  }
-
-  // ─── Player State Monitoring (User Interactions) ────────────────
+  // ─── Player State Monitoring ────────────────────────────────────
 
   function checkPlayerState() {
     if (!player || suppressEvents || !isInSession) return;
@@ -176,12 +89,8 @@
       const videoId = getVideoId();
       const rate = player.getPlaybackRate ? player.getPlaybackRate() : 1;
 
-      // Detect Play
+      // 1. Detect Play (transition to state 1 from any other state)
       if (state === 1 && lastState !== 1) {
-        suppressEvents = true;
-        // Pause momentarily so all devices start simultaneously at executeAt
-        player.pauseVideo();
-
         postToContent({
           type: 'player-event',
           action: 'play',
@@ -192,9 +101,8 @@
         });
       }
 
-      // Detect Pause
-      else if (state === 2 && lastState !== 2 && lastState !== -1) {
-        suppressEvents = true;
+      // 2. Detect Pause (transition to state 2 from state 1)
+      else if (state === 2 && lastState === 1) {
         postToContent({
           type: 'player-event',
           action: 'pause',
@@ -205,19 +113,15 @@
         });
       }
 
-      // Detect Seek (scrubbed by > 1.2 seconds)
-      else if (Math.abs(time - lastTime) > 1.2 && lastTime !== -1) {
-        suppressEvents = true;
-        const isPlaying = (state === 1);
-        if (isPlaying) player.pauseVideo();
-
+      // 3. Detect Seek (jump in time while playing or paused)
+      else if (lastTime !== -1 && Math.abs(time - lastTime) > 1.5 && (state === 1 || state === 2)) {
         postToContent({
           type: 'player-event',
           action: 'seek',
           videoId,
           currentTime: time,
           playbackRate: rate,
-          isPlaying,
+          isPlaying: (state === 1),
         });
       }
 
@@ -233,100 +137,50 @@
     return urlParams.get('v') || '';
   }
 
-  // ─── Message Handling from Content Script ───────────────────────
-
-  window.addEventListener('message', (event) => {
-    if (event.source !== window) return;
-    if (!event.data || event.data.source !== 'yt-sync-content') return;
-
-    const msg = event.data;
-
-    switch (msg.type) {
-      case 'execute-action':
-        executeAction(msg);
-        break;
-
-      case 'apply-state':
-        applyFullState(msg);
-        break;
-
-      case 'get-position':
-        reportPosition();
-        break;
-
-      case 'timeline-update':
-        if (msg.clockOffset !== undefined) clockOffset = msg.clockOffset;
-        if (msg.timeline) {
-          if (!timeline || !timeline.version || msg.timeline.version >= timeline.version) {
-            timeline = msg.timeline;
-          }
-        }
-        break;
-
-      case 'clock-offset-update':
-        if (msg.clockOffset !== undefined) {
-          clockOffset = msg.clockOffset;
-        }
-        break;
-
-      case 'session-status':
-        isInSession = !!msg.isInSession;
-        isHost = !!msg.isHost;
-        if (msg.clockOffset !== undefined) clockOffset = msg.clockOffset;
-        if (msg.timeline) timeline = msg.timeline;
-        if (!isInSession) {
-          applyPlaybackRate(1.0);
-        }
-        break;
-    }
-  });
-
-  // ─── Action Execution ──────────────────────────────────────────
+  // ─── Action Execution (Remote Commands) ─────────────────────────
 
   function executeAction(msg) {
     if (!player) player = findPlayer();
     if (!player) return;
 
+    // Suppress local event detection while applying remote command
     suppressEvents = true;
-    if (msg.timeline) timeline = msg.timeline;
-
-    const baseRate = (timeline && timeline.playbackRate) || msg.playbackRate || 1.0;
 
     try {
+      const video = getVideoElement();
+      const baseRate = msg.playbackRate || 1;
+
       switch (msg.action) {
         case 'play': {
-          const targetTime = (timeline && timeline.anchorVideoTime !== undefined)
-            ? timeline.anchorVideoTime
-            : (msg.currentTime !== undefined ? msg.currentTime : player.getCurrentTime());
-
-          const video = getVideoElement();
-          const cur = video ? video.currentTime : player.getCurrentTime();
-          if (Math.abs(cur - targetTime) > 0.05) {
-            player.seekTo(targetTime, true);
+          if (msg.videoId && msg.videoId !== getVideoId()) {
+            window.location.href = `https://www.youtube.com/watch?v=${msg.videoId}&t=${Math.floor(msg.currentTime || 0)}`;
+            return;
           }
-          applyPlaybackRate(baseRate);
+          if (msg.currentTime !== undefined) {
+            const curTime = video ? video.currentTime : player.getCurrentTime();
+            if (Math.abs(curTime - msg.currentTime) > 0.05) {
+              player.seekTo(msg.currentTime, true);
+            }
+          }
+          setVideoRate(baseRate);
           player.playVideo();
           break;
         }
 
         case 'pause': {
           player.pauseVideo();
-          const targetTime = (timeline && timeline.anchorVideoTime !== undefined)
-            ? timeline.anchorVideoTime
-            : msg.currentTime;
-          if (targetTime !== undefined && Math.abs(player.getCurrentTime() - targetTime) > 0.05) {
-            player.seekTo(targetTime, true);
+          if (msg.currentTime !== undefined) {
+            player.seekTo(msg.currentTime, true);
           }
-          applyPlaybackRate(baseRate);
+          setVideoRate(baseRate);
           break;
         }
 
         case 'seek': {
-          const targetTime = msg.currentTime !== undefined
-            ? msg.currentTime
-            : (timeline ? timeline.anchorVideoTime : 0);
-          player.seekTo(targetTime, true);
-          applyPlaybackRate(baseRate);
+          if (msg.currentTime !== undefined) {
+            player.seekTo(msg.currentTime, true);
+          }
+          setVideoRate(baseRate);
           if (msg.isPlaying) {
             player.playVideo();
           } else {
@@ -346,18 +200,19 @@
       console.error('[YT-Sync] Error executing action:', e);
     }
 
+    // Re-enable local event detection after YouTube state settles
     setTimeout(() => {
       suppressEvents = false;
       lastState = player ? player.getPlayerState() : -1;
       const v = getVideoElement();
       lastTime = v ? v.currentTime : (player ? player.getCurrentTime() : -1);
-    }, 350);
+    }, 400);
   }
 
   function applyFullState(msg) {
     if (!player) player = findPlayer();
     if (!player) {
-      setTimeout(() => applyFullState(msg), 1000);
+      setTimeout(() => applyFullState(msg), 800);
       return;
     }
 
@@ -369,7 +224,9 @@
         return;
       }
 
-      player.seekTo(msg.currentTime || 0, true);
+      if (msg.currentTime !== undefined) {
+        player.seekTo(msg.currentTime, true);
+      }
 
       if (msg.isPlaying) {
         player.playVideo();
@@ -377,7 +234,7 @@
         player.pauseVideo();
       }
 
-      applyPlaybackRate(msg.playbackRate || 1);
+      setVideoRate(msg.playbackRate || 1);
     } catch (e) {
       console.error('[YT-Sync] Error applying state:', e);
     }
@@ -387,7 +244,64 @@
       lastState = player ? player.getPlayerState() : -1;
       const v = getVideoElement();
       lastTime = v ? v.currentTime : (player ? player.getCurrentTime() : -1);
-    }, 500);
+    }, 600);
+  }
+
+  // ─── Continuous Drift Correction ────────────────────────────────
+
+  function handleDriftCorrection(msg) {
+    if (!player || isHost || suppressEvents) return;
+    if (isAdPlaying()) return;
+
+    try {
+      const isPlaying = player.getPlayerState() === 1;
+      if (!isPlaying || !msg.isPlaying) return;
+
+      const video = getVideoElement();
+      const myTime = video ? video.currentTime : player.getCurrentTime();
+      const targetTime = msg.targetTime || msg.hostTime;
+      if (targetTime === undefined || targetTime < 0) return;
+
+      const drift = myTime - targetTime; // positive = ahead, negative = behind
+      const absDrift = Math.abs(drift);
+      const baseRate = msg.playbackRate || 1.0;
+
+      // 1. Within 15ms — virtually in phase, perfect sync!
+      if (absDrift < 0.015) {
+        setVideoRate(baseRate);
+        return;
+      }
+
+      // 2. Large desync (> 350ms) — quick seek to snap into place
+      if (absDrift > 0.350) {
+        suppressEvents = true;
+        player.seekTo(targetTime, true);
+        setVideoRate(baseRate);
+        setTimeout(() => {
+          suppressEvents = false;
+          lastState = player ? player.getPlayerState() : -1;
+          const v = getVideoElement();
+          lastTime = v ? v.currentTime : (player ? player.getCurrentTime() : -1);
+        }, 300);
+        return;
+      }
+
+      // 3. Micro-drift (15ms - 350ms) — smooth proportional rate adjustment!
+      // Scale rate smoothly by ±0.8% to ±4.0%
+      const adjustment = Math.min(0.04, Math.max(0.008, absDrift * 0.20));
+      const correctedRate = drift > 0 ? (baseRate - adjustment) : (baseRate + adjustment);
+
+      setVideoRate(correctedRate);
+
+      // Restore base rate after 1.2s to smoothly level off
+      if (driftCorrectionTimer) clearTimeout(driftCorrectionTimer);
+      driftCorrectionTimer = setTimeout(() => {
+        setVideoRate(baseRate);
+      }, 1200);
+
+    } catch (e) {
+      console.error('[YT-Sync] Drift correction error:', e);
+    }
   }
 
   // ─── Position Reporting ────────────────────────────────────────
@@ -409,6 +323,41 @@
       // ignore
     }
   }
+
+  // ─── Messages from Content Script ───────────────────────────────
+
+  window.addEventListener('message', (event) => {
+    if (event.source !== window) return;
+    if (!event.data || event.data.source !== 'yt-sync-content') return;
+
+    const msg = event.data;
+
+    switch (msg.type) {
+      case 'execute-action':
+        executeAction(msg);
+        break;
+
+      case 'apply-state':
+        applyFullState(msg);
+        break;
+
+      case 'get-position':
+        reportPosition();
+        break;
+
+      case 'drift-correction':
+        handleDriftCorrection(msg);
+        break;
+
+      case 'session-status':
+        isInSession = !!msg.isInSession;
+        isHost = !!msg.isHost;
+        if (!isInSession) {
+          setVideoRate(1.0);
+        }
+        break;
+    }
+  });
 
   // ─── Helper ────────────────────────────────────────────────────
 
