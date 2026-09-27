@@ -301,13 +301,12 @@
     console.log(`[YT-Sync] Follower transitioning to host video: ${targetVideoId} (from: "${curId}")`);
     lastVideoId = targetVideoId;
 
-    // If player exists and supports loadVideoById, use it to avoid full page reload
+    const startSec = Math.floor(startTime || 0);
+
+    // If player exists and supports loadVideoById, use it with positional arguments (string, number)
     if (player && typeof player.loadVideoById === 'function') {
       try {
-        player.loadVideoById({
-          videoId: targetVideoId,
-          startSeconds: Math.floor(startTime || 0)
-        });
+        player.loadVideoById(targetVideoId, startSec);
         return true;
       } catch (e) {
         console.warn('[YT-Sync] loadVideoById error, falling back to location.href:', e);
@@ -315,7 +314,7 @@
     }
 
     // Direct URL navigation (works from homepage, search, or if player not loaded)
-    window.location.href = `https://www.youtube.com/watch?v=${targetVideoId}&t=${Math.floor(startTime || 0)}`;
+    window.location.href = `https://www.youtube.com/watch?v=${targetVideoId}&t=${startSec}`;
     return true;
   }
 
@@ -562,14 +561,14 @@
         const drift = myTime - targetTime; // positive = follower ahead, negative = follower behind
         const absDrift = Math.abs(drift);
 
-        // A) Within 15ms: In phase! Perfect sync.
-        if (absDrift < 0.015) {
+        // A) Within 25ms: In phase! Smooth sync.
+        if (absDrift < 0.025) {
           setVideoRate(baseRate);
           return;
         }
 
-        // B) Large discrepancy (> 350ms): Snap to host's position immediately
-        if (absDrift > 0.350) {
+        // B) Large discrepancy (> 1.2s): Snap to host's position immediately
+        if (absDrift > 1.200) {
           suppressEvents = true;
           if (video) video.currentTime = targetTime;
           player.seekTo(targetTime, true);
@@ -583,9 +582,9 @@
           return;
         }
 
-        // C) Micro-drift (15ms to 350ms): Smooth proportional rate adjustment (±1% - ±5%)
+        // C) Micro-drift (25ms to 1.2s): Smooth proportional rate adjustment (±1.5% - ±7%)
         // Seamlessly slides follower into lockstep without audio cutouts or buffering
-        const adjustment = Math.min(0.05, Math.max(0.01, absDrift * 0.15));
+        const adjustment = Math.min(0.07, Math.max(0.015, absDrift * 0.12));
         const correctedRate = drift > 0 ? (baseRate - adjustment) : (baseRate + adjustment);
 
         setVideoRate(correctedRate);
@@ -607,18 +606,22 @@
     if (!player) player = findPlayer();
     if (!player) return;
 
+    const video = getVideoElement();
+    const isPlaying = video ? (!video.paused && player.getPlayerState() === 1) : (player.getPlayerState() === 1);
+
     // If tab is hidden and paused, don't report (avoids background tab interference)
-    if (document.hidden && player.getPlayerState() !== 1) return;
+    if (document.hidden && !isPlaying) return;
 
     try {
-      const video = getVideoElement();
       const videoId = getVideoId();
       if (!videoId) return;
 
+      const currentTime = video ? video.currentTime : player.getCurrentTime();
+
       postToContent({
         type: 'position-response',
-        currentTime: video ? video.currentTime : player.getCurrentTime(),
-        isPlaying: player.getPlayerState() === 1,
+        currentTime,
+        isPlaying,
         playbackRate: player.getPlaybackRate ? player.getPlaybackRate() : 1,
         videoId,
         clientTimestamp: Date.now(),

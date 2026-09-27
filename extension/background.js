@@ -16,6 +16,7 @@ let clientName = 'User';
 let isConnected = false;
 let isHost = false;
 let sessionState = null;
+let currentClients = [];
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 10;
 const RECONNECT_BASE_DELAY = 1000;
@@ -193,11 +194,12 @@ function handleServerMessage(msg) {
       clientId = msg.clientId;
       isHost = true;
       sessionState = null;
+      currentClients = msg.clients || [{ id: clientId, name: clientName, isHost: true }];
       broadcastToContentScripts({
         type: 'session-update',
         sessionCode,
         clientId,
-        clients: msg.clients,
+        clients: currentClients,
         clockOffset: Math.round(clockOffset),
         isHost: true,
       });
@@ -209,11 +211,12 @@ function handleServerMessage(msg) {
       clientId = msg.clientId;
       isHost = false;
       sessionState = msg.state;
+      currentClients = msg.clients || [];
       broadcastToContentScripts({
         type: 'session-update',
         sessionCode,
         clientId,
-        clients: msg.clients,
+        clients: currentClients,
         state: msg.state,
         clockOffset: Math.round(clockOffset),
         isHost: false,
@@ -225,24 +228,28 @@ function handleServerMessage(msg) {
       sessionCode = null;
       isHost = false;
       sessionState = null;
+      currentClients = [];
       broadcastToContentScripts({ type: 'session-left' });
       broadcastConnectionStatus();
       break;
 
     case 'client-joined':
     case 'client-left':
+      currentClients = msg.clients || currentClients;
       broadcastToContentScripts({
         type: msg.type,
-        clients: msg.clients,
+        clients: currentClients,
         clientId: msg.clientId,
         clientName: msg.clientName,
         client: msg.client,
       });
+      broadcastConnectionStatus();
       break;
 
     case 'promoted-to-host':
       isHost = true;
       broadcastToContentScripts({ type: 'promoted-to-host' });
+      broadcastConnectionStatus();
       break;
 
     case 'sync-execute':
@@ -312,6 +319,9 @@ function broadcastConnectionStatus(errorMessage = null) {
     isConnected,
     sessionCode,
     clientId,
+    clientName,
+    isHost,
+    clients: currentClients,
     clockOffset: Math.round(clockOffset),
     clockRtt: Math.round(clockRtt),
     serverUrl,
@@ -337,6 +347,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         clientId,
         clientName,
         isHost,
+        clients: currentClients,
         state: sessionState,
         clockOffset: Math.round(clockOffset),
         clockRtt: Math.round(clockRtt),
@@ -435,3 +446,16 @@ setInterval(() => {
     sendToServer({ type: 'ping' });
   }
 }, 25000);
+
+// Auto-inject content script into open YouTube tabs upon extension install/reload
+chrome.runtime.onInstalled.addListener(() => {
+  chrome.tabs.query({ url: ['*://*.youtube.com/*', '*://youtube.com/*'] }, (tabs) => {
+    if (!tabs) return;
+    for (const tab of tabs) {
+      chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        files: ['content.js']
+      }).catch(() => {});
+    }
+  });
+});

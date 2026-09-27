@@ -165,6 +165,10 @@ chrome.runtime.onMessage.addListener((msg) => {
   switch (msg.type) {
     case 'connection-status':
       updateUI(msg);
+      if (msg.clients && Array.isArray(msg.clients)) {
+        currentClients = msg.clients;
+        renderMembers();
+      }
       if (msg.error) {
         showToast(msg.error, true);
       }
@@ -203,25 +207,30 @@ function updateUI(status) {
       els.sessionCodeDisplay.textContent = status.sessionCode;
       showPanel('active');
 
+      if (status.clients && Array.isArray(status.clients)) {
+        currentClients = status.clients;
+        renderMembers();
+      }
+
       // Update stats
       const rtt = status.clockRtt;
       const offset = status.clockOffset;
 
-      els.latencyValue.textContent = rtt < 1000 ? `${rtt}ms` : '--';
-      els.offsetValue.textContent = offset !== undefined ? `${offset}ms` : '--';
+      els.latencyValue.textContent = (rtt !== undefined && rtt < 3000) ? `${rtt}ms` : '--';
+      els.offsetValue.textContent = (offset !== undefined && Math.abs(offset) < 10000) ? `${offset}ms` : '--';
 
-      if (rtt < 50) {
+      if (rtt < 100) {
         els.syncStatus.textContent = 'Excellent';
         els.syncStatus.className = 'stat-value sync-good';
-      } else if (rtt < 150) {
+      } else if (rtt < 250) {
         els.syncStatus.textContent = 'Good';
         els.syncStatus.className = 'stat-value sync-good';
-      } else if (rtt < 300) {
-        els.syncStatus.textContent = 'Fair';
-        els.syncStatus.className = 'stat-value sync-warn';
+      } else if (rtt < 500) {
+        els.syncStatus.textContent = 'Synced';
+        els.syncStatus.className = 'stat-value sync-good';
       } else {
-        els.syncStatus.textContent = 'Poor';
-        els.syncStatus.className = 'stat-value sync-bad';
+        els.syncStatus.textContent = 'High Ping';
+        els.syncStatus.className = 'stat-value sync-warn';
       }
     } else {
       showPanel('session');
